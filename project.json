@@ -1,0 +1,53 @@
+{
+  "name": "TrueDepthDemo2",
+  "source_dirs": ["TrueDepthDemo2", "components"],
+  "skip_dir_names": [
+    ".git", ".build", ".swiftpm", "__pycache__", ".reports",
+    "Pods", "build", "DerivedData", "Carthage", "vendor", "node_modules",
+    "Frameworks", "Example", "Tests", "UITests",
+    "snapshots", "generated"
+  ],
+  "skip_path_parts": [
+    "/SDWebImage/",
+    "/Flutter.framework/",
+    "/QWeather.framework/",
+    "/.git/",
+    "/.build/"
+  ],
+  "include_exts": [".h", ".m", ".mm", ".swift", ".storyboard", ".xib"],
+  "skip_file_globs": [
+    "*-Swift.h",
+    "Pods-*.h",
+    "*.generated.swift",
+    "*.pb.swift",
+    "R.generated.swift"
+  ],
+  "own_class_patterns": [
+    "^(TB|LM|TD|My)[A-Za-z0-9_]*$"
+  ],
+  "http_managers": [
+    "TBRequestManager",
+    "TDNetworkFacade",
+    "TDURLSessionNetworkClient",
+    "TBHttpRequestManager",
+    "AFHTTPSessionManager"
+  ],
+  "api_manager_patterns": [
+    "^(TB|TD|LM|My)[A-Za-z0-9_]*(Network|Http|HTTP|API|Api|Client|Facade)[A-Za-z0-9_]*$"
+  ],
+  "view_controller_bases": [
+    "UIViewController",
+    "UITableViewController",
+    "UICollectionViewController",
+    "UINavigationController",
+    "UITabBarController",
+    "UISplitViewController",
+    "UIHostingController",
+    "UIInputViewController",
+    "UIPageViewController",
+    "TBBaseViewController"
+  ],
+  "min_method_body_lines": 0,
+  "max_body_chars": 8000,
+  "max_fts_body_chars": 4000
+}

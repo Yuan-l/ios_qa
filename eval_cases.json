@@ -1,0 +1,258 @@
+{
+  "version": 1,
+  "description": "模型无关的 golden 用例：直接验证查询层返回的类、文件、行号。任何 MCP 客户端都应得到同样的底层结果。",
+  "cases": [
+    {
+      "id": "feature-network",
+      "type": "find_feature",
+      "args": {
+        "query": "网络 请求",
+        "limit": 10
+      },
+      "checks": [
+        {
+          "kind": "class_in_results",
+          "value": "TBRequestManager"
+        }
+      ],
+      "reason": "中文双词检索能归并到网络门面",
+      "last_reviewed": "2026-11-15"
+    },
+    {
+      "id": "feature-home",
+      "type": "find_feature",
+      "args": {
+        "query": "首页",
+        "limit": 10
+      },
+      "checks": [
+        {
+          "kind": "class_in_results",
+          "value": "QWeatherHomeViewController"
+        }
+      ],
+      "reason": "单个中文词命中页面类",
+      "last_reviewed": "2026-11-15"
+    },
+    {
+      "id": "feature-breadcrumb",
+      "type": "find_feature",
+      "args": {
+        "query": "性能 监控",
+        "limit": 10
+      },
+      "checks": [
+        {
+          "kind": "class_in_results",
+          "value": "TBBreadCrumbKit"
+        }
+      ],
+      "reason": "中文 FTS 与方法体命中",
+      "last_reviewed": "2026-11-15"
+    },
+    {
+      "id": "symbol-superclass",
+      "type": "search_symbol",
+      "args": {
+        "name": "TBRequestManager",
+        "limit": 1
+      },
+      "checks": [
+        {
+          "kind": "superclass_equals",
+          "value": "NSObject"
+        },
+        {
+          "kind": "min_results",
+          "value": 1
+        }
+      ],
+      "reason": "类定义解析：父类必须正确，否则继承链/影响面全错",
+      "last_reviewed": "2026-11-15"
+    },
+    {
+      "id": "symbol-method-line",
+      "type": "search_symbol",
+      "args": {
+        "name": "TBRequestManager",
+        "limit": 1
+      },
+      "checks": [
+        {
+          "kind": "method_at_line",
+          "file_suffix": "TBRequestManager.h",
+          "method_name": "shared",
+          "line": 29
+        }
+      ],
+      "reason": "头文件方法声明行号必须准确",
+      "last_reviewed": "2026-11-15"
+    },
+    {
+      "id": "trace-callers",
+      "type": "trace_class",
+      "args": {
+        "class_name": "TBRequestManager",
+        "limit": 80
+      },
+      "checks": [
+        {
+          "kind": "trace_found"
+        },
+        {
+          "kind": "file_line_present",
+          "list": "callers",
+          "file_suffix": "TBFinanceHTTP.m",
+          "line": 74
+        }
+      ],
+      "reason": "trace 必须能看到真实调用方；调用边丢失时影响面会漏",
+      "last_reviewed": "2026-11-15"
+    },
+    {
+      "id": "trace-api-endpoints",
+      "type": "trace_class",
+      "args": {
+        "class_name": "TBFinanceService",
+        "limit": 80
+      },
+      "checks": [
+        {
+          "kind": "api_url_contains",
+          "value": "/api/qt/ulist.np/get"
+        },
+        {
+          "kind": "api_url_contains",
+          "value": "/FundSearch/api/FundSearchAPI.ashx"
+        }
+      ],
+      "reason": "接口路径来自真实 URL 字面量",
+      "last_reviewed": "2026-11-15"
+    },
+    {
+      "id": "callers-file-line",
+      "type": "find_callers",
+      "args": {
+        "target": "TBRequestManager",
+        "limit": 50
+      },
+      "checks": [
+        {
+          "kind": "file_line_present",
+          "list": "callers",
+          "file_suffix": "TBFinanceHTTP.m",
+          "line": 74
+        }
+      ],
+      "reason": "调用方行号必须与源码一致，是 Agent 定位代码的关键",
+      "last_reviewed": "2026-11-15"
+    },
+    {
+      "id": "methods-body-search",
+      "type": "search_methods",
+      "args": {
+        "query": "采样",
+        "limit": 10
+      },
+      "checks": [
+        {
+          "kind": "min_results",
+          "value": 1
+        }
+      ],
+      "reason": "方法体 / 注释全文检索",
+      "last_reviewed": "2026-11-15"
+    },
+    {
+      "id": "read-focus",
+      "type": "read_source",
+      "args": {
+        "file_path": "components/TBNetworkManager/Classess/Objc/TBRequestManager.h",
+        "focus": "shared",
+        "context": 3
+      },
+      "checks": [
+        {
+          "kind": "read_focus_matched"
+        },
+        {
+          "kind": "read_content_contains",
+          "value": "+ (instancetype)shared"
+        }
+      ],
+      "reason": "read_source 的 focus 定位与返回内容可用于精确读源码",
+      "last_reviewed": "2026-11-15"
+    },
+    {
+      "id": "pages-finance",
+      "type": "list_pages",
+      "args": {
+        "module": "TBFinanceKit",
+        "limit": 100
+      },
+      "checks": [
+        {
+          "kind": "min_results",
+          "value": 3
+        }
+      ],
+      "reason": "页面发现：VC 子类识别失败会导致页面入口缺失",
+      "last_reviewed": "2026-11-15"
+    },
+    {
+      "id": "module-scale",
+      "type": "list_module",
+      "args": {
+        "module": "TDMonitorKit"
+      },
+      "checks": [
+        {
+          "kind": "field_gte",
+          "field": "classes",
+          "value": 100
+        }
+      ],
+      "reason": "模块聚合：类数量统计错误说明过滤/归属有问题",
+      "last_reviewed": "2026-11-15"
+    },
+    {
+      "id": "impact-network-facade",
+      "type": "impact_analysis",
+      "args": {
+        "target": "TDMonitor",
+        "depth": 1,
+        "limit": 50
+      },
+      "checks": [
+        {
+          "kind": "level_class_present",
+          "value": "TDNetworkFacade"
+        }
+      ],
+      "reason": "影响面 BFS：改动 TDMonitor 必须能追到 TDNetworkFacade",
+      "last_reviewed": "2026-11-15"
+    },
+    {
+      "id": "index-health",
+      "type": "info",
+      "args": {},
+      "checks": [
+        {
+          "kind": "warnings_empty"
+        },
+        {
+          "kind": "field_gte",
+          "field": "methods_with_body",
+          "value": 1000
+        },
+        {
+          "kind": "field_gte",
+          "field": "counts.classes",
+          "value": 250
+        }
+      ],
+      "reason": "索引健康基线：方法数为 0 或类数量异常时查询不可用",
+      "last_reviewed": "2026-11-15"
+    }
+  ]
+}
