@@ -270,14 +270,14 @@
           "kind": "navigation_edge",
           "from": "AppDelegate",
           "to": "TBFinanceHomeViewController",
-          "line": 52,
+          "line": 58,
           "edge_kind": "tab"
         },
         {
           "kind": "navigation_edge",
           "from": "TBFinanceHomeViewController",
           "to": "TBFinanceDetailViewController",
-          "line": 793,
+          "line": 838,
           "edge_kind": "push"
         }
       ],
@@ -298,7 +298,7 @@
           "kind": "navigation_edge",
           "from": "AppDelegate",
           "to": "TBTabbarViewController",
-          "line": 63,
+          "line": 69,
           "edge_kind": "root"
         },
         {
@@ -407,7 +407,7 @@
           "from": "AppDelegate",
           "to": "TBInfrastructureDemoViewController",
           "edge_kind": "tab",
-          "line": 60
+          "line": 66
         }
       ],
       "reason": "多行类声明 + #if DEBUG 里的 tab 页面也要进索引，否则入口链断",
@@ -489,6 +489,53 @@
         }
       ],
       "reason": "trace 要能说清扩展/分类来自哪个 category、哪个文件",
+      "last_reviewed": "2026-11-15"
+    },
+    {
+      "id": "trace-ambiguous-class",
+      "type": "trace_class",
+      "args": {
+        "class_name": "TBTabbarViewController",
+        "limit": 10
+      },
+      "checks": [
+        {
+          "kind": "trace_found"
+        },
+        {
+          "kind": "ambiguous",
+          "min": 2
+        },
+        {
+          "kind": "candidate_modules",
+          "values": [
+            "TBCustomHomePage",
+            "MyCameraModule"
+          ]
+        }
+      ],
+      "reason": "两个模块各有一个 TBTabbarViewController，trace 必须标明当前用的是哪个声明点",
+      "last_reviewed": "2026-11-15"
+    },
+    {
+      "id": "trace-ambiguous-module",
+      "type": "trace_class",
+      "args": {
+        "class_name": "TBTabbarViewController",
+        "module": "MyCameraModule",
+        "limit": 20
+      },
+      "checks": [
+        {
+          "kind": "ambiguous",
+          "min": 2
+        },
+        {
+          "kind": "all_methods_module",
+          "value": "MyCameraModule"
+        }
+      ],
+      "reason": "按模块消歧后，方法只能来自该模块，不能混进另一个同名类",
       "last_reviewed": "2026-11-15"
     }
   ]

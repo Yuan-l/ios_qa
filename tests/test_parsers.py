@@ -12,6 +12,7 @@ from pathlib import Path
 from ios_qa.config import ProjectProfile
 from ios_qa.discover import SourceFile
 from ios_qa.parsers import objc, swift, ui
+from ios_qa.source import mask_comments, ui_strings
 
 
 def make_source(root: Path, rel: str, content: str) -> SourceFile:
@@ -330,6 +331,47 @@ class UITest(ParserTestBase):
         self.assertEqual(entry.kind, "storyboard")
         self.assertEqual(len(result.navigation), 1)
         self.assertEqual(result.navigation[0].identifier, "toDetail")
+
+
+class UiStringsTest(unittest.TestCase):
+    """UI 文案提取：只取含中文的字符串字面量，注释里的中文不算。"""
+
+    def test_only_chinese_literals(self) -> None:
+        code = mask_comments(
+            'self.title = @"行情";\n'
+            'NSString *slug = @"finance.stock";\n'
+            'label.text = @"暂无数据，下拉刷新";\n'
+        )
+        self.assertEqual(ui_strings(code, "objc"), ["行情", "暂无数据，下拉刷新"])
+
+    def test_comment_text_is_not_a_literal(self) -> None:
+        code = mask_comments(
+            '// 这里是 "行情" 的说明\n'
+            '/* 也别把 "首页" 当成文案 */\n'
+            'self.title = @"行情";\n'
+        )
+        self.assertEqual(ui_strings(code, "objc"), ["行情"])
+
+    def test_escapes_and_format_specifiers(self) -> None:
+        code = mask_comments(
+            'NSString *s = @"行情加载失败 category=%ld error=%@";\n'
+            'NSString *q = @"他说：\\"买入\\"";\n'
+        )
+        self.assertEqual(
+            ui_strings(code, "objc"),
+            ['行情加载失败 category=%ld error=%@', '他说：\\"买入\\"'],
+        )
+
+    def test_swift_multiline_and_limit(self) -> None:
+        code = mask_comments(
+            'let hint = """\n数据来源：东方财富\n"""\n'
+            + "".join(f'let t{i} = "标题{i}"\n' for i in range(5))
+        )
+        self.assertEqual(ui_strings(code, "swift", limit=3), ["数据来源：东方财富", "标题0", "标题1"])
+
+    def test_long_text_is_skipped(self) -> None:
+        code = mask_comments('NSString *s = @"' + "长" * 130 + '";\n')
+        self.assertEqual(ui_strings(code, "objc"), [])
 
 
 if __name__ == "__main__":

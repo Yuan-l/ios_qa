@@ -83,10 +83,14 @@ def search_symbol(name: str, limit: int = 10) -> str:
 
 
 @mcp.tool()
-def trace_class(class_name: str, limit: int = 80) -> str:
-    """查类数据流：继承链、方法、依赖/被依赖、API、通知、调用方/被调方、页面跳转。"""
+def trace_class(class_name: str, limit: int = 80, module: str = "") -> str:
+    """查类数据流：继承链、方法、依赖/被依赖、API、通知、调用方/被调方、页面跳转。
+
+    同名类出现在多个模块时默认只看方法最多的声明点，返回 ``ambiguous`` 与
+    ``candidates``；传 ``module`` 可以切到指定模块。
+    """
     with _service() as service:
-        return _dump(service.trace_class(class_name, limit=limit))
+        return _dump(service.trace_class(class_name, limit=limit, module=module))
 
 
 @mcp.tool()

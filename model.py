@@ -27,6 +27,7 @@ class SymbolRec:
     interface_text: str = ""
     extension_of: str = ""
     category_name: str = ""
+    literals: list[str] = field(default_factory=list)
 
 
 @dataclass

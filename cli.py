@@ -28,6 +28,7 @@ import json
 import sys
 from pathlib import Path
 
+from . import SCHEMA_VERSION
 from .build import build
 from .config import ProjectProfile
 from .eval import run_eval
@@ -227,7 +228,9 @@ def cmd_symbol(args) -> int:
 
 def cmd_trace(args) -> int:
     with _service(args) as service:
-        data = service.trace_class(args.class_name, limit=args.limit)
+        data = service.trace_class(
+            args.class_name, limit=args.limit, module=getattr(args, "module", "")
+        )
     if args.json:
         _dump(data)
         return 0
@@ -244,7 +247,20 @@ def cmd_trace(args) -> int:
         print(f"  协议: {', '.join(data['protocols'])}")
     if data["doc_comment"]:
         print(f"  注释: {_truncate(data['doc_comment'], 200)}")
-    print(f"  方法: {data['method_count']} 个实现  扩展: {data['extension_count']}")
+    method_line = f"  方法: {data['method_count']} 个实现  扩展: {data['extension_count']}"
+    if data.get("ambiguous"):
+        method_line += f"（当前声明点 {data.get('scoped_method_count', 0)} 个）"
+    print(method_line)
+    if data.get("ambiguous"):
+        selected = data.get("selected_module", "")
+        print(f"  ⚠ 同名类出现在 {len(data['candidates'])} 个声明点，"
+              f"当前只看 {selected}")
+        for cand in data["candidates"]:
+            mark = "*" if cand["module"] == selected else " "
+            print(f"    {mark} {cand['module']:<20} {cand['kind']:<10} "
+                  f"{cand['method_count']} 方法  "
+                  f"[{cand['file_path']}:{cand['line_start']}]")
+        print("    用 --module <模块> 切换；不指定时默认方法最多的那个")
 
     _section("方法", [
         f"{m['signature']}   [{m['file_path']}:{m['line_start']}-{m['line_end']}]"
@@ -578,7 +594,10 @@ def cmd_doctor(args) -> int:
     if db_path.exists():
         with QueryService(profile, db_path) as service:
             info = service.info()
-            checks.append(("schema", info["schema_version"] == "1", info["schema_version"]))
+            checks.append(
+                ("schema", info["schema_version"] == str(SCHEMA_VERSION),
+                 info["schema_version"])
+            )
             checks.append(("classes > 0", info["counts"]["classes"] > 0,
                            str(info["counts"]["classes"])))
             checks.append(("methods > 0", info["counts"]["methods"] > 0,
@@ -630,6 +649,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("trace", parents=[common], help="查类数据流/调用链")
     p.add_argument("class_name")
     p.add_argument("--limit", type=int, default=80)
+    p.add_argument("--module", default="", help="同名类按模块消歧")
     p.set_defaults(func=cmd_trace)
 
     p = sub.add_parser("methods", parents=[common], help="全文检索方法体")

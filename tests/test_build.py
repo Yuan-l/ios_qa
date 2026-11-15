@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -140,6 +141,136 @@ class BuildTest(unittest.TestCase):
             self.assertEqual(result["results"][0]["id"], saved["id"])
 
 
+class AmbiguousClassTest(unittest.TestCase):
+    """同名类出现在多个模块时，trace 必须能说清楚用的是哪一个。"""
+
+    SWIFT_A = """\
+import UIKit
+
+final class TBSharedViewController: UIViewController {
+    func alpha() {}
+    func beta() {}
+}
+"""
+
+    SWIFT_B = """\
+import UIKit
+
+final class TBSharedViewController: UIViewController {
+    func gamma() {}
+}
+"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        (self.root / "ModA").mkdir()
+        (self.root / "ModB").mkdir()
+        (self.root / "ModA" / "TBSharedViewController.swift").write_text(
+            self.SWIFT_A, encoding="utf-8"
+        )
+        (self.root / "ModB" / "TBSharedViewController.swift").write_text(
+            self.SWIFT_B, encoding="utf-8"
+        )
+        self.profile = ProjectProfile(name="Demo", root=self.root, source_dirs=["."])
+        self.db_path = self.root / "kb.db"
+        build(self.profile, self.db_path, full=True, verbose=False)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_sites_recorded(self) -> None:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM classes WHERE class_name = 'TBSharedViewController'"
+        ).fetchone()
+        conn.close()
+        self.assertEqual(row["is_ambiguous"], 1)
+        self.assertEqual(row["module"], "ModA")  # 方法多的声明点是主声明点
+        sites = json.loads(row["sites_json"])
+        self.assertEqual({site["module"] for site in sites}, {"ModA", "ModB"})
+        self.assertEqual({site["module"]: site["method_count"] for site in sites},
+                         {"ModA": 2, "ModB": 1})
+
+    def test_trace_scopes_to_module(self) -> None:
+        with QueryService(self.profile, self.db_path) as service:
+            default = service.trace_class("TBSharedViewController")
+            self.assertTrue(default["ambiguous"])
+            self.assertEqual(default["selected_module"], "ModA")
+            self.assertEqual({m["method_name"] for m in default["methods"]},
+                             {"alpha", "beta"})
+
+            scoped = service.trace_class("TBSharedViewController", module="ModB")
+            self.assertEqual(scoped["selected_module"], "ModB")
+            self.assertEqual({m["method_name"] for m in scoped["methods"]}, {"gamma"})
+
+            # 未知模块回退到主声明点，不会返回空结果
+            fallback = service.trace_class("TBSharedViewController", module="Nope")
+            self.assertEqual(fallback["selected_module"], "ModA")
+
+
+class UiLiteralSearchTest(unittest.TestCase):
+    """界面文案也是检索信号：类名是英文、只有中文标题的页面必须找得到。"""
+
+    PAGE = """\
+import UIKit
+
+final class TBMarketDeskViewController: UIViewController {
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        title = "行情"
+        view.backgroundColor = .white
+    }
+}
+"""
+
+    COMMENTED = """\
+import UIKit
+
+// 这个页面没有界面文案，注释里也不写业务词
+final class TBUnrelatedDeskViewController: UIViewController {
+}
+"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        (self.root / "App").mkdir()
+        (self.root / "App" / "TBMarketDeskViewController.swift").write_text(
+            self.PAGE, encoding="utf-8"
+        )
+        (self.root / "App" / "TBUnrelatedDeskViewController.swift").write_text(
+            self.COMMENTED, encoding="utf-8"
+        )
+        self.profile = ProjectProfile(name="Demo", root=self.root, source_dirs=["."])
+        self.db_path = self.root / "kb.db"
+        build(self.profile, self.db_path, full=True, verbose=False)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_literals_land_in_class_search_text(self) -> None:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        rows = {
+            row["class_name"]: row["search_text"]
+            for row in conn.execute(
+                "SELECT class_name, search_text FROM classes WHERE class_name LIKE 'TB%'"
+            )
+        }
+        conn.close()
+        self.assertIn("行情", rows["TBMarketDeskViewController"])
+        self.assertNotIn("行情", rows["TBUnrelatedDeskViewController"])
+
+    def test_find_feature_by_ui_title(self) -> None:
+        with QueryService(self.profile, self.db_path) as service:
+            found = service.find_feature("行情", limit=5)
+            names = [item["class_name"] for item in found["results"]]
+            self.assertIn("TBMarketDeskViewController", names)
+            self.assertNotIn("TBUnrelatedDeskViewController", names)
+
+
 class RealRepoSmokeTest(unittest.TestCase):
     """对当前仓库构建一次，验证解析/行号/查询链路。"""
 
@@ -192,22 +323,26 @@ class RealRepoSmokeTest(unittest.TestCase):
             self.assertTrue(result["reachable"])
             self.assertIn("AppDelegate", result["roots"])
             hops = [
-                (hop["from_class"], hop["to_class"], hop["kind"], hop["line_number"])
+                (hop["from_class"], hop["to_class"], hop["kind"])
                 for path in result["paths"]
                 for hop in path["chain"]
             ]
+            # 具体行号由 eval_cases.json 的 golden 负责固定：源码每次改动都会挪行，
+            # 单测只保证「这条链存在且带行号」。
             self.assertIn(
-                ("AppDelegate", "TBFinanceHomeViewController", "tab", 52), hops
+                ("AppDelegate", "TBFinanceHomeViewController", "tab"), hops
             )
             self.assertIn(
                 (
                     "TBFinanceHomeViewController",
                     "TBFinanceDetailViewController",
                     "push",
-                    793,
                 ),
                 hops,
             )
+            for hop in result["paths"]:
+                for edge in hop["chain"]:
+                    self.assertGreater(edge["line_number"], 0)
 
     def test_navigation_missing_class(self) -> None:
         with QueryService(self.profile, self.db_path) as service:
@@ -231,12 +366,12 @@ class RealRepoSmokeTest(unittest.TestCase):
             self.assertTrue(result["found"])
             self.assertTrue(result["reachable"])
             hops = [
-                (hop["from_class"], hop["to_class"], hop["kind"], hop["line_number"])
+                (hop["from_class"], hop["to_class"], hop["kind"])
                 for path in result["paths"]
                 for hop in path["chain"]
             ]
             self.assertIn(
-                ("AppDelegate", "TBInfrastructureDemoViewController", "tab", 60), hops
+                ("AppDelegate", "TBInfrastructureDemoViewController", "tab"), hops
             )
 
     def test_delegate_and_block_dispatch(self) -> None:
@@ -274,6 +409,24 @@ class RealRepoSmokeTest(unittest.TestCase):
             self.assertIn("TBFinanceHomeViewController", names)
             pairs = {(item["from"], item["to"]) for item in result.get("synonyms", [])}
             self.assertIn(("报价", "行情"), pairs)
+
+    def test_ambiguous_repo_class(self) -> None:
+        with QueryService(self.profile, self.db_path) as service:
+            traced = service.trace_class("TBTabbarViewController", limit=20)
+            self.assertTrue(traced["ambiguous"])
+            self.assertEqual(
+                {c["module"] for c in traced["candidates"]},
+                {"TBCustomHomePage", "MyCameraModule"},
+            )
+
+            scoped = service.trace_class(
+                "TBTabbarViewController", limit=20, module="MyCameraModule"
+            )
+            self.assertEqual({m["module"] for m in scoped["methods"]}, {"MyCameraModule"})
+            self.assertTrue(
+                all(row["module"] == "MyCameraModule" for row in scoped["navigation_out"])
+            )
+            self.assertNotEqual(traced["selected_module"], scoped["selected_module"])
 
     def test_doctor_metrics(self) -> None:
         with QueryService(self.profile, self.db_path) as service:

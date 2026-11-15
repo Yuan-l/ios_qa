@@ -29,7 +29,11 @@ def _call(service: QueryService, case: dict) -> dict:
     if kind == "search_symbol":
         return service.search_symbol(args["name"], limit=args.get("limit", 10))
     if kind == "trace_class":
-        return service.trace_class(args["class_name"], limit=args.get("limit", 80))
+        return service.trace_class(
+            args["class_name"],
+            limit=args.get("limit", 80),
+            module=args.get("module", ""),
+        )
     if kind == "search_methods":
         return service.search_methods(
             args.get("query", ""),
@@ -223,6 +227,24 @@ def _check(data: dict, spec: dict) -> tuple[bool, str]:
         pairs = {(item.get("from"), item.get("to")) for item in data.get("synonyms") or []}
         ok = (spec["from"], spec["to"]) in pairs
         return ok, f"synonyms={sorted(pairs)}"
+
+    if kind == "ambiguous":
+        candidates = data.get("candidates") or []
+        ok = bool(data.get("ambiguous")) and len(candidates) >= int(spec.get("min", 2))
+        return ok, (
+            f"ambiguous={data.get('ambiguous')} selected={data.get('selected_module')!r} "
+            f"candidates={[(c.get('module'), c.get('method_count')) for c in candidates]}"
+        )
+
+    if kind == "candidate_modules":
+        modules = {candidate.get("module") for candidate in data.get("candidates") or []}
+        missing = [name for name in spec["values"] if name not in modules]
+        return not missing, f"modules={sorted(modules)}"
+
+    if kind == "all_methods_module":
+        modules = {method.get("module") for method in data.get("methods") or []}
+        ok = bool(modules) and modules == {spec["value"]}
+        return ok, f"method modules={sorted(modules)}"
 
     if kind == "extension_category":
         for row in data.get("extensions", []):

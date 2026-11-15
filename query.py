@@ -51,6 +51,8 @@ def _class_row(row: sqlite3.Row, detail: bool = False) -> dict:
         "is_app_entry": bool(row["is_app_entry"]),
         "line_start": row["line_start"],
         "line_end": row["line_end"],
+        "ambiguous": bool(row["is_ambiguous"]),
+        "sites": _json_list(row["sites_json"]),
     }
     if detail:
         data["interface_text"] = row["interface_text"]
@@ -423,20 +425,22 @@ class QueryService:
             item["methods"] = self._top_methods(item["class_name"], 30)
         return {"query": name, "results": results}
 
-    def _top_methods(self, class_name: str, limit: int) -> list[dict]:
+    def _top_methods(self, class_name: str, limit: int, module: str = "") -> list[dict]:
+        cond = " AND module = ?" if module else ""
+        params: tuple = (class_name, module, limit) if module else (class_name, limit)
         rows = self.conn.execute(
-            """
-            SELECT * FROM methods WHERE class_name = ?
+            f"""
+            SELECT * FROM methods WHERE class_name = ?{cond}
             ORDER BY has_body DESC, is_class_method DESC, line_start LIMIT ?
             """,
-            (class_name, limit),
+            params,
         ).fetchall()
         return [_method_row(row) for row in rows]
 
     # ------------------------------------------------------------------
     # 数据流 / 调用链 / 影响面
     # ------------------------------------------------------------------
-    def trace_class(self, class_name: str, limit: int = 80) -> dict:
+    def trace_class(self, class_name: str, limit: int = 80, module: str = "") -> dict:
         class_name = (class_name or "").strip()
         row = self.conn.execute(
             "SELECT * FROM classes WHERE class_name = ? COLLATE NOCASE", (class_name,)
@@ -454,15 +458,45 @@ class QueryService:
 
         limit = max(1, min(int(limit), 300))
         info = _class_row(row, detail=True)
+        sites = info.get("sites") or []
+        ambiguous = bool(info.get("ambiguous"))
+        candidates: list[dict] = []
+        selected_module = ""
+        if ambiguous:
+            candidates = [
+                {
+                    "module": site.get("module", ""),
+                    "kind": site.get("kind", ""),
+                    "file_path": site.get("file_path", ""),
+                    "line_start": site.get("line_start", 0),
+                    "method_count": site.get("method_count", 0),
+                }
+                for site in sites
+            ]
+            requested = (module or "").strip()
+            known = {candidate["module"] for candidate in candidates}
+            selected_module = requested if requested in known else candidates[0]["module"]
+
+        # 同名类合并了多个模块的声明时，按选中的声明点收敛，避免把两个类混在一起。
+        # 只收敛「属于本类自己的行」（方法/依赖/调用/通知/跳转/扩展）；
+        # 反向的「谁依赖我、谁调用我」按类名匹配，不同模块的同名类分不开，
+        # 宁多勿漏，所以不过滤。
+        def scoped(column: str = "module") -> tuple[str, tuple]:
+            if not selected_module:
+                return "", ()
+            return f" AND {column} = ?", (selected_module,)
+
+        cond, extra = scoped()
         chain = self._superclass_chain(class_name)
-        methods = self._top_methods(class_name, limit)
+        methods = self._top_methods(class_name, limit, module=selected_module)
         deps = _dedup_dicts(
             (
                 {"dep_class": r["dep_class"], "dep_kind": r["dep_kind"],
                  "file_path": r["file_path"], "line": r["line_number"]}
                 for r in self.conn.execute(
-                    "SELECT * FROM deps WHERE from_class = ? ORDER BY dep_kind, dep_class",
-                    (class_name,),
+                    "SELECT * FROM deps WHERE from_class = ?" + cond
+                    + " ORDER BY dep_kind, dep_class",
+                    (class_name, *extra),
                 )
             ),
             ("dep_class", "dep_kind"),
@@ -481,38 +515,44 @@ class QueryService:
         )
         api_calls = [
             dict(r) for r in self.conn.execute(
-                "SELECT * FROM api_calls WHERE class_name = ? ORDER BY line_number",
-                (class_name,),
+                "SELECT * FROM api_calls WHERE class_name = ?" + cond
+                + " ORDER BY line_number",
+                (class_name, *extra),
             )
         ]
         notifications = [
             dict(r) for r in self.conn.execute(
-                "SELECT * FROM notifications WHERE class_name = ? ORDER BY register_line",
-                (class_name,),
+                "SELECT * FROM notifications WHERE class_name = ?" + cond
+                + " ORDER BY register_line",
+                (class_name, *extra),
             )
         ]
         callers = [
             dict(r) for r in self.conn.execute(
-                "SELECT * FROM calls WHERE callee_class = ? ORDER BY caller_class, line_number LIMIT ?",
+                "SELECT * FROM calls WHERE callee_class = ? "
+                "ORDER BY caller_class, line_number LIMIT ?",
                 (class_name, limit),
             )
         ]
         callees = [
             dict(r) for r in self.conn.execute(
-                "SELECT * FROM calls WHERE caller_class = ? ORDER BY callee_class, line_number LIMIT ?",
-                (class_name, limit),
+                "SELECT * FROM calls WHERE caller_class = ?" + cond
+                + " ORDER BY callee_class, line_number LIMIT ?",
+                (class_name, *extra, limit),
             )
         ]
         nav_in = [
             dict(r) for r in self.conn.execute(
-                "SELECT * FROM navigation WHERE to_class = ? ORDER BY from_class LIMIT ?",
+                "SELECT * FROM navigation WHERE to_class = ? "
+                "ORDER BY from_class LIMIT ?",
                 (class_name, limit),
             )
         ]
         nav_out = [
             dict(r) for r in self.conn.execute(
-                "SELECT * FROM navigation WHERE from_class = ? ORDER BY to_class LIMIT ?",
-                (class_name, limit),
+                "SELECT * FROM navigation WHERE from_class = ?" + cond
+                + " ORDER BY to_class LIMIT ?",
+                (class_name, *extra, limit),
             )
         ]
         extensions = [
@@ -530,10 +570,17 @@ class QueryService:
             }
             for r in self.conn.execute(
                 "SELECT * FROM symbols WHERE class_name = ? "
-                "AND kind IN ('extension','category','category_impl') ORDER BY line_start",
-                (class_name,),
+                "AND kind IN ('extension','category','category_impl')" + cond
+                + " ORDER BY line_start",
+                (class_name, *extra),
             )
         ]
+        scoped_count = len(methods)
+        if ambiguous:
+            for candidate in candidates:
+                if candidate["module"] == selected_module:
+                    scoped_count = candidate["method_count"]
+                    break
         entrypoints = [
             dict(r) for r in self.conn.execute(
                 "SELECT * FROM entrypoints WHERE class_name = ?", (class_name,)
@@ -546,6 +593,10 @@ class QueryService:
             "resolved_from": resolved_from,
             "found": True,
             **info,
+            "ambiguous": ambiguous,
+            "selected_module": selected_module,
+            "scoped_method_count": scoped_count,
+            "candidates": candidates,
             "superclass_chain": chain,
             "methods": methods,
             "deps": deps,
@@ -918,8 +969,10 @@ class QueryService:
         unique: list[dict] = []
         seen_paths: set[tuple] = set()
         for path in paths:
+            # 同一条逻辑链只留一条：rootViewController 的创建与赋值可能被解析成
+            # 两条同 (from, to, kind) 的边，行号不同但对「怎么到这个页面」没区别。
             key = tuple(
-                (e["from_class"], e["to_class"], e["kind"], e["line_number"])
+                (e["from_class"], e["to_class"], e["kind"], e["file_path"])
                 for e in path["chain"]
             )
             if key in seen_paths:

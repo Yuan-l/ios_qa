@@ -136,6 +136,67 @@ def _mask(text: str, language: str, mask_strings: bool) -> str:
     return "".join(chars)
 
 
+CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+
+
+def ui_strings(
+    text: str,
+    language: str = "objc",
+    limit: int = 40,
+    max_chars: int = 120,
+) -> list[str]:
+    """提取含中文的字符串字面量（页面标题、按钮文案、错误提示）。
+
+    输入必须是 **已屏蔽注释** 的文本（:func:`mask_comments` 的结果），否则注释
+    里的引号会被当成字面量。只保留含中文的、长度合理的串，用于把「用户看得见的
+    文案」接进类级检索：``self.title = @"行情"`` 这类代码里类名是英文的页面，
+    用户在知识库里往往用界面上的中文去找。
+    """
+    if not text:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    n = len(text)
+    i = 0
+    swift = language == "swift"
+    while i < n:
+        if text[i] != '"':
+            i += 1
+            continue
+        if swift and text.startswith('"""', i):
+            end = text.find('"""', i + 3)
+            if end < 0:
+                break
+            chunk = text[i + 3 : end]
+            i = end + 3
+        else:
+            j = i + 1
+            buf: list[str] = []
+            while j < n:
+                char = text[j]
+                if char == "\\" and j + 1 < n:
+                    buf.append(text[j : j + 2])
+                    j += 2
+                    continue
+                if char == '"':
+                    j += 1
+                    break
+                buf.append(char)
+                j += 1
+            chunk = "".join(buf)
+            i = j
+        chunk = " ".join(chunk.split())
+        if not chunk or len(chunk) > max_chars or not CJK_RE.search(chunk):
+            continue
+        if chunk in seen:
+            continue
+        seen.add(chunk)
+        out.append(chunk)
+        if len(out) >= limit:
+            break
+    return out
+
+
 class LineMap:
     """字符偏移 <-> 1-based 行号。"""
 

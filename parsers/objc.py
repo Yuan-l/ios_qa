@@ -42,6 +42,7 @@ from ..source import (
     mask_comments,
     normalize_type,
     split_top_level,
+    ui_strings,
 )
 from ..textnorm import build_search_text  # noqa: F401  (由 classes 聚合使用)
 
@@ -238,6 +239,7 @@ def parse_header(
 ) -> ParseResult:
     result = ParseResult()
     masked = mask_code(text, "objc")
+    comments = mask_comments(text, "objc")
     line_map = LineMap(text)
     lines = text.splitlines()
     rel = _rel(file)
@@ -303,6 +305,7 @@ def parse_header(
             interface_text=body_original.strip()[:8000],
             extension_of=extension_of,
             category_name=category_name,
+            literals=ui_strings(comments[body_start:end], "objc"),
         )
         result.symbols.append(symbol)
         result.methods.extend(methods)
@@ -482,6 +485,7 @@ def parse_implementation(
                 extension_of=class_name if is_category else "",
                 category_name=category or "",
                 doc_comment=leading_comment(lines, line_start - 1),
+                literals=ui_strings(comments[impl_start:end], "objc"),
             )
         )
         result.methods.extend(methods)

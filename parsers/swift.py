@@ -39,6 +39,7 @@ from ..source import (
     mask_comments,
     normalize_type,
     split_top_level,
+    ui_strings,
 )
 
 TYPE_RE = re.compile(
@@ -264,6 +265,7 @@ def parse_swift(text: str, file: SourceFile, profile: ProjectProfile) -> ParseRe
             doc_comment=leading_comment(lines, line_start - 1),
             interface_text=text[match.start():close_brace + 1][:8000],
             extension_of=extension_of,
+            literals=ui_strings(comments[open_brace:close_brace], "swift"),
         )
         result.symbols.append(symbol)
         type_ranges.append(

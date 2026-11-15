@@ -59,7 +59,8 @@ CREATE TABLE IF NOT EXISTS symbols (
     doc_comment    TEXT DEFAULT '',
     interface_text TEXT DEFAULT '',
     extension_of   TEXT DEFAULT '',
-    category_name  TEXT DEFAULT ''
+    category_name  TEXT DEFAULT '',
+    literals_json  TEXT DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS idx_symbols_class ON symbols(class_name);
 CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_path);
@@ -210,6 +211,8 @@ CREATE TABLE IF NOT EXISTS classes (
     is_app_entry    INTEGER DEFAULT 0,
     line_start      INTEGER DEFAULT 0,
     line_end        INTEGER DEFAULT 0,
+    is_ambiguous    INTEGER DEFAULT 0,
+    sites_json      TEXT DEFAULT '[]',
     search_text     TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_classes_module ON classes(module);
@@ -292,6 +295,17 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(DDL)
+    # 已有数据库不会因 CREATE TABLE IF NOT EXISTS 新增列，这里做轻量迁移
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(classes)")}
+    for name, decl in (
+        ("is_ambiguous", "INTEGER DEFAULT 0"),
+        ("sites_json", "TEXT DEFAULT '[]'"),
+    ):
+        if name not in existing:
+            conn.execute(f"ALTER TABLE classes ADD COLUMN {name} {decl}")
+    symbol_cols = {row[1] for row in conn.execute("PRAGMA table_info(symbols)")}
+    if "literals_json" not in symbol_cols:
+        conn.execute("ALTER TABLE symbols ADD COLUMN literals_json TEXT DEFAULT '[]'")
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     if version != SCHEMA_VERSION:
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
@@ -335,15 +349,15 @@ def write_result(
                 symbol_key, class_name, kind, language, module, file_path,
                 line_start, line_end, superclass, protocols_json,
                 properties_json, doc_comment, interface_text, extension_of,
-                category_name
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                category_name, literals_json
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 symbol.symbol_key, symbol.class_name, symbol.kind, symbol.language,
                 symbol.module, symbol.file_path, symbol.line_start, symbol.line_end,
                 symbol.superclass, _json(symbol.protocols), _json(symbol.properties),
                 symbol.doc_comment, symbol.interface_text, symbol.extension_of,
-                symbol.category_name,
+                symbol.category_name, _json(symbol.literals),
             ),
         )
 
@@ -469,6 +483,85 @@ def reflow_preview(body: str, signature: str) -> str:
     return text[:320]
 
 
+DECLARATION_KINDS = {"class", "struct", "enum", "actor", "protocol", "implementation"}
+
+
+def _site_key(module: str, file_path: str) -> tuple[str, str, str]:
+    """声明点 = (模块, 目录, 文件名主干)；头文件与实现文件算同一个点。"""
+    path = Path(file_path)
+    return (module or "", str(path.parent), path.stem)
+
+
+def _declaration_sites(
+    rows: list[sqlite3.Row],
+    method_rows: list[sqlite3.Row],
+) -> list[dict]:
+    """找出同名类的全部声明点。
+
+    只有 ``class/struct/enum/actor/protocol/implementation`` 才算声明；
+    category / extension 属于宿主类，不算第二个声明点。
+    """
+    buckets: dict[tuple[str, str, str], dict] = {}
+    for row in rows:
+        if row["kind"] not in DECLARATION_KINDS:
+            continue
+        key = _site_key(row["module"], row["file_path"])
+        site = buckets.setdefault(
+            key,
+            {
+                "module": row["module"],
+                "dir": key[1],
+                "stem": key[2],
+                "kind": row["kind"],
+                "file_path": row["file_path"],
+                "line_start": row["line_start"],
+                "files": [],
+                "method_count": 0,
+            },
+        )
+        if row["file_path"] not in site["files"]:
+            site["files"].append(row["file_path"])
+        if row["kind"] != "implementation":
+            site["kind"] = row["kind"]
+            site["file_path"] = row["file_path"]
+            site["line_start"] = row["line_start"]
+    sites = list(buckets.values())
+    if not sites:
+        return []
+    for method in method_rows:
+        mkey = _site_key(method["module"], method["file_path"])
+        match = buckets.get(mkey)
+        if match is None:
+            # 方法写在分类/扩展文件里，按模块归到该模块的声明点
+            for site in sites:
+                if site["module"] == method["module"]:
+                    match = site
+                    break
+        if match is not None:
+            match["method_count"] += 1
+    sites.sort(key=lambda s: (-s["method_count"], s["module"], s["dir"], s["stem"]))
+    return sites
+
+
+def _base_row(rows: list[sqlite3.Row], primary: dict | None) -> sqlite3.Row:
+    """选代表行：优先主声明点，再按类型/后缀/有超类/行号。"""
+
+    def rank(row: sqlite3.Row) -> tuple:
+        return (
+            0 if row["kind"] in {"class", "struct", "enum", "protocol", "actor"} else 1,
+            0 if row["file_path"].endswith((".h", ".swift")) else 1,
+            0 if row["superclass"] else 1,
+            row["line_start"],
+        )
+
+    if primary is not None:
+        key = (primary["module"], primary["dir"], primary["stem"])
+        local = [row for row in rows if _site_key(row["module"], row["file_path"]) == key]
+        if local:
+            return sorted(local, key=rank)[0]
+    return sorted(rows, key=rank)[0]
+
+
 def rebuild_classes(conn: sqlite3.Connection, profile: ProjectProfile) -> int:
     """从 symbols/methods 重建 classes 聚合表，并刷新全部 FTS。"""
     symbols = conn.execute(
@@ -476,8 +569,8 @@ def rebuild_classes(conn: sqlite3.Connection, profile: ProjectProfile) -> int:
     ).fetchall()
     methods_by_class: dict[str, list[sqlite3.Row]] = {}
     for row in conn.execute(
-        "SELECT class_name, method_name, signature, has_body FROM methods "
-        "ORDER BY class_name, method_name"
+        "SELECT class_name, method_name, signature, has_body, module, file_path "
+        "FROM methods ORDER BY class_name, method_name"
     ):
         methods_by_class.setdefault(row["class_name"], []).append(row)
 
@@ -521,15 +614,11 @@ def rebuild_classes(conn: sqlite3.Connection, profile: ProjectProfile) -> int:
             r["kind"] == "storyboard" for r in rows
         ):
             continue
-        base = sorted(
-            rows,
-            key=lambda r: (
-                0 if r["kind"] in {"class", "struct", "enum", "protocol", "actor"} else 1,
-                0 if r["file_path"].endswith((".h", ".swift")) else 1,
-                0 if r["superclass"] else 1,
-                r["line_start"],
-            ),
-        )[0]
+        sites = _declaration_sites(rows, methods_by_class.get(class_name, []))
+        base = _base_row(rows, sites[0] if sites else None)
+        primary_key = (
+            _site_key(sites[0]["module"], sites[0]["file_path"]) if sites else None
+        )
         protocols: list[str] = []
         properties: list[dict] = []
         categories: list[str] = []
@@ -539,6 +628,7 @@ def rebuild_classes(conn: sqlite3.Connection, profile: ProjectProfile) -> int:
         impl_path = ""
         extension_count = 0
         doc = ""
+        literals: list[str] = []
         for row in rows:
             modules.add(row["module"])
             if row["language"]:
@@ -559,11 +649,18 @@ def rebuild_classes(conn: sqlite3.Connection, profile: ProjectProfile) -> int:
                 extension_count += 1
             if not doc and row["doc_comment"]:
                 doc = row["doc_comment"]
+            # UI 文案只取主声明点，避免同名类把另一个模块的界面文字带进来
+            if primary_key and _site_key(row["module"], row["file_path"]) == primary_key:
+                for lit in json.loads(row["literals_json"] or "[]"):
+                    if lit and lit not in literals:
+                        literals.append(lit)
         method_rows = methods_by_class.get(class_name, [])
         method_names = [m["method_name"] for m in method_rows]
         body_method_count = sum(1 for m in method_rows if m["has_body"])
         primary_module = (
-            "App" if "App" in modules else sorted(modules)[0] if modules else ""
+            sites[0]["module"] if sites
+            else "App" if "App" in modules
+            else sorted(modules)[0] if modules else ""
         )
         vc_flag, vc_base = is_view_controller(class_name)
         is_app_entry = int(
@@ -579,6 +676,7 @@ def rebuild_classes(conn: sqlite3.Connection, profile: ProjectProfile) -> int:
             " ".join(categories),
             " ".join(f'{p.get("name", "")} {p.get("type", "")}' for p in properties),
             " ".join(method_names[:80]),
+            " ".join(literals[:12]),
             doc,
             header_path,
             impl_path,
@@ -607,6 +705,8 @@ def rebuild_classes(conn: sqlite3.Connection, profile: ProjectProfile) -> int:
                 is_app_entry,
                 base["line_start"],
                 base["line_end"],
+                int(len(sites) > 1),
+                _json(sites),
                 search_text,
             )
         )
@@ -619,8 +719,8 @@ def rebuild_classes(conn: sqlite3.Connection, profile: ProjectProfile) -> int:
             protocols_json, properties_json, method_count, method_names,
             extension_count, header_path, impl_path, file_path, doc_comment,
             interface_text, is_view_controller, vc_base, is_app_entry,
-            line_start, line_end, search_text
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            line_start, line_end, is_ambiguous, sites_json, search_text
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         rows_out,
     )

@@ -25,7 +25,7 @@ python3 -m ios_qa build --check
 # 自检
 python3 -m ios_qa doctor
 
-# 模型无关的 golden 验收（25 个用例，不调用任何 LLM）
+# 模型无关的 golden 验收（27 个用例，不调用任何 LLM）
 python3 -m ios_qa eval
 
 # MCP 双客户端验收（协议层 + 数据层，失败退出码 1）
@@ -67,7 +67,7 @@ python3 -m ios_qa notifications --unbalanced
 | `info` | 构建时间、分支、脏文件、表计数、健康警告 |
 | `find <描述>` | 按中文/英文功能描述找类与页面（类名 + FTS + 方法体 + 入口融合排序） |
 | `symbol <名称>` | 查类/方法签名、属性、文件行号 |
-| `trace <类>` | 继承链、方法、依赖/被依赖、API、通知配对、调用方/被调方、跳转、相关问答 |
+| `trace <类>` | 继承链、方法、依赖/被依赖、API、通知配对、调用方/被调方、跳转、相关问答；`--module` 消歧同名类 |
 | `methods [query]` | 方法体全文检索，支持 `--class` / `--module` |
 | `callers <目标>` | `TBRequestManager` 或 `TBRequestManager.requestWithMethod` 的调用方 |
 | `impact <目标>` | 反向 BFS 影响面，`--depth 1..4` |
@@ -101,14 +101,16 @@ TBFinanceDetailViewController  导航  (TBFinanceKit)
 
   路径 1  (入口 AppDelegate / 2 跳)
     AppDelegate --tab--> TBFinanceHomeViewController
-      [TrueDepthDemo2/AppDelegate.swift:52]
+      [TrueDepthDemo2/AppDelegate.swift:58]
     TBFinanceHomeViewController --push--> TBFinanceDetailViewController
-      [components/TBFinanceKit/TBFinanceKit/Classes/UI/TBFinanceHomeViewController.m:793]
+      [components/TBFinanceKit/TBFinanceKit/Classes/UI/TBFinanceHomeViewController.m:838]
 ```
 
 `path` 只做图上的连通性回溯，不猜类型：强边来自 `navigation`
 （push/present/root/tab/segue），弱边来自 `deps` 的 `instantiate`
-（未能识别的容器写法），同一对类已有强边时丢弃弱边。
+（未能识别的容器写法），同一对类已有强边时丢弃弱边。同一条逻辑链只返回
+一条：`rootViewController` 的创建与赋值会被解析成两条同 (from, to, kind)
+的边，行号不同但对「怎么到这个页面」没有区别，`incoming` 里仍能看到全部边。
 没有连通路径时返回 `incoming` 直接来源，并说明未连通原因。
 
 ---
@@ -140,7 +142,7 @@ MCP 是协议，不绑定客户端：OpenCode、Cursor、Claude Code、自研 Ag
 | `kb_info` | 索引健康信息 |
 | `find_feature` | 功能/页面检索（中文） |
 | `search_symbol` | 类名/方法名符号检索 |
-| `trace_class` | 类数据流全量视图 |
+| `trace_class` | 类数据流全量视图；同名类返回 `ambiguous`/`candidates`，可传 `module` 消歧 |
 | `search_methods` | 方法体全文检索 |
 | `find_callers` | 调用方 |
 | `impact_analysis` | 影响面分析 |
@@ -209,7 +211,7 @@ MCP 验收：TrueDepthDemo2  (ios_qa/.data/ios_qa.db)
 ios_qa/
 ├── config.py          Profile：所有项目差异（目录、类前缀、HTTP 门面、VC 基类）
 ├── discover.py        源码发现、目录/文件过滤、sha256
-├── source.py          注释/字符串屏蔽、括号配对、行号换算、URL 清洗
+├── source.py          注释/字符串屏蔽、括号配对、行号换算、URL 清洗、UI 文案提取
 ├── textnorm.py        CJK 单字+bigram、驼峰拆词、FTS 表达式
 ├── synonyms.py        业务别名加载与查询扩展
 ├── synonyms.json      业务别名分组（行情/报价、崩溃/crash …）
@@ -278,6 +280,49 @@ VC +4、App 入口 +3。
   `find_feature` 的 `search_text` 也包含分类名（搜 `BreadCrumb` 能命中宿主类）；
 - 多行类声明（`final class Foo: Bar,` 换行后 `Baz {`）也能识别——这是
   `TBInfrastructureDemoViewController` 之前整个文件没进索引的原因。
+
+### 同名类消歧
+
+仓库里有三处同名声明：`Item`（App 的 enum + TDMonitorKit 的 struct）、
+`LocalUserDefaultPropertyWrapper`（MyCameraModule 两个目录）、
+`TBTabbarViewController`（MyCameraModule + TBCustomHomePage）。聚合表按类名
+建行，但 `classes.sites_json` 会记录每个**声明点**：
+
+- 声明点 = (模块, 目录, 文件名主干)，头文件与实现文件算同一个点；
+  category / extension 属于宿主类，不算第二个声明点；
+- `is_ambiguous=1` 表示有多个声明点，`sites_json` 带模块、类型、文件行号
+  与该方法数；
+- `trace` 默认只看方法最多的声明点，返回 `ambiguous` / `selected_module` /
+  `candidates` / `scoped_method_count`；`trace <类> --module <模块>` 切换后，
+  属于本类自己的行（方法、依赖、通知、跳出的跳转、扩展）只取该模块；
+- 反向的「谁依赖我 / 谁调用我 / 谁跳进来」按类名匹配，不同模块的同名类在
+  `deps` / `calls` / `navigation` 里本来分不开，所以宁多勿漏，不做模块过滤；
+- 传了不存在的模块名会回退到主声明点，不返回空结果。
+
+```
+$ python3 -m ios_qa trace TBTabbarViewController --limit 5
+TBTabbarViewController  (class/swift/TBCustomHomePage)
+  方法: 9 个实现  扩展: 0（当前声明点 6 个）
+  ⚠ 同名类出现在 2 个声明点，当前只看 TBCustomHomePage
+    * TBCustomHomePage     class      6 方法  [.../TBTabbarViewController.swift:5]
+      MyCameraModule       class      3 方法  [.../ViewController/TBTabbarViewController.swift:11]
+```
+
+### 界面文案（UI 字面量）
+
+类名是英文、但用户只知道界面上的中文时（`self.title = @"行情"`、按钮文案、
+错误提示），只索引类名/方法签名就会漏。解析层给每个类记录主声明点范围内的
+**含中文字符串字面量**（`symbols.literals_json`），聚合时取前 12 条写进
+`classes.search_text`：
+
+- 只收字符串，不收注释文字（注释走 `doc_comment`，本来就在检索里）；
+- 掩码后提取，`@"..."` 与 Swift `"""..."""` 都支持，含转义与格式符；
+- 长度上限 120 字符、每类前 12 条，避免长文案把 FTS 索引撑爆；
+- 只取**主声明点**的文件，同名类不会把另一个模块的界面文字带进来。
+
+效果：`报价`（同义词 → 行情）现在由行情页自身的 `@"行情"` 命中，而不是
+靠类名里带 `Quote` 的模型类；`find_feature("行情")` 的第一名是
+`TBFinanceHomeViewController`。
 
 ### 调用解析：协议 / block
 
@@ -367,14 +412,16 @@ python3 -m unittest discover -s ios_qa/tests -v
 - 同义词扩展：报价→行情（保留 Quote 字面命中）、jank→卡顿
 - 协议/block 调用：`delegate?.foo()`、`self.onSelect(x)`，含头文件属性与同文件 extension
 - 扩展/分类归属：`search_symbol("BreadCrumb")`、`trace` 的 `extension_category`
+- 同名类消歧：声明点识别、`trace --module` 收敛、未知模块回退
+- UI 文案：字面量提取（跳过注释/纯英文/超长）、类级检索命中
 - 多行类声明、头文件变更触发同目录实现重解析
 - MCP 工具集合与调用返回（14 个工具）
 - 双客户端验收：stdlib JSON-RPC 客户端、官方 SDK 客户端、`save_qa` 写路径往返、
   `mcp-smoke` 退出码
 - `build --check`：通过 / 失败退出码 3 / 无用例跳过 / 不加参数不跑 eval
 - 真实仓库 smoke：规模、`TBRequestManager.h:29`、`TBFinanceHTTP.m:74`、
-  `AppDelegate.swift:48 → TBFinanceHomeViewController.m:793` 导航链
-- `run_eval()`：25 个 golden 用例全绿，且每条都带 `last_reviewed`
+  入口链存在性（具体行号由 golden 负责，源码每次改动都会挪行）
+- `run_eval()`：27 个 golden 用例全绿，且每条都带 `last_reviewed`
 
 ---
 
@@ -434,6 +481,9 @@ python3 -m ios_qa build --check
 | `summary_gte` | `summary` 某字段 ≥ 期望值 |
 | `synonyms_applied` | 本次检索应用了指定别名对（`from` / `to`） |
 | `extension_category` | `trace` 的扩展列表含指定 category（可加 `file_suffix`） |
+| `ambiguous` | `trace` 判定为同名类，且候选声明点不少于 `min` 个 |
+| `candidate_modules` | `candidates` 覆盖 `values` 里的全部模块 |
+| `all_methods_module` | `methods` 全部来自指定模块 |
 
 ### 维护策略
 
@@ -472,16 +522,18 @@ eval 失败
 | 全量构建耗时 | 约 3~4s（364 文件 / 5.1 万行） |
 | 重复构建 | `files_parsed=0`，计数不变 |
 | 解析失败 | 0 |
-| 索引规模 | 350 类 / 2257 方法 / 4103 调用边 / 1098 依赖边 / 64 导航边 / 21 通知 |
+| 索引规模 | 352 类 / 2266 方法 / 4119 调用边 / 1102 依赖边 / 64 导航边 / 21 通知 |
 | 关键词验证 | 中文 FTS 命中；头文件/实现/调用方行号与源码一致 |
-| 入口路径 | `path TBFinanceDetailViewController`：AppDelegate --tab@52--> 行情首页 --push@793--> 详情页 |
+| 入口路径 | `path TBFinanceDetailViewController`：AppDelegate --tab@58--> 行情首页 --push@838--> 详情页 |
 | 通知配对 | 未配对 1 条：`CameraViewController.tbLanguageDidChange`（只注册不移除） |
-| 业务别名 | `报价` 同时命中 `TBFinanceQuote` 与行情页；`jank` → 卡顿 → `TDLongTaskMonitor` |
+| 业务别名 | `报价` 经同义词命中行情页 `TBFinanceHomeViewController`（靠界面文案 `@"行情"`）；`jank` → 卡顿 → `TDLongTaskMonitor` |
 | 协议/block 调用 | `delegate?.captureOutput` → `CameraCaptureViewModelDelegate`；`onSelect` 4 处 block 调用 |
 | 分类归属 | `search_symbol("BreadCrumb")` 命中 `UIViewController` 等 5 个宿主类 |
-| `eval` golden 用例 | **25/25 通过**（不依赖任何模型） |
+| 同名类消歧 | `trace TBTabbarViewController` 返回 2 个声明点，`--module` 切换后方法不串模块 |
+| `eval` golden 用例 | **27/27 通过**（不依赖任何模型） |
 | MCP 双客户端验收 | `raw-jsonrpc` 与 `python-sdk` 各 14 个工具；13 个只读工具与查询层逐字段一致 |
-| 测试 | 57 个 unittest 全部通过 |
+| UI 文案检索 | `find_feature("行情")` 命中 `TBFinanceHomeViewController`；注释里的中文不进类级检索 |
+| 测试 | 68 个 unittest 全部通过 |
 
 手动抽查建议：
 
@@ -506,6 +558,8 @@ python3 -m ios_qa notifications --unbalanced
   自定义工厂函数里间接返回页面、跨文件的 tab 组装仍可能只落到 `instantiate` 弱边；
 - 协议/block 调用只解析同文件属性（ObjC 额外读同目录 `.h`），跨文件 delegate
   属性仍是启发式，`confidence=low`；
+- 同名类在 `classes` 里仍是一行（`method_count` 是合并值），
+  `trace --module` 只收敛查询结果，不改写聚合表；
 - 向量检索、相似代码、重复扫描（参考系统的 6 个工具）留到 P3；
 - 不解析 Objective-C++ 模板细节与宏展开。
 
@@ -526,4 +580,7 @@ python3 -m ios_qa notifications --unbalanced
   方法调用、tab 容器创建页面的导航边、多行类声明；golden 扩到 25 条；
 - **P2-c（已完成）**：双 MCP 客户端接入验收（`mcp-smoke`：stdlib JSON-RPC +
   官方 SDK，协议层 + 数据层三方比对）；
+- **P2-d（已完成）**：同名类消歧 —— 识别多个声明点、`trace --module` 收敛；
+  界面文案进类级检索（`symbols.literals_json`）；`path` 同链去重；golden 扩到
+  27 条；
 - **P3**：向量层（`sqlite-vec` 或外部索引）+ 相似代码/重复扫描 + Agent Loom 接入。

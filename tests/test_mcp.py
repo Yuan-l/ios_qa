@@ -79,6 +79,18 @@ class McpTest(unittest.TestCase):
 
         self.assertIn("TBHomeViewController", asyncio.run(run()))
 
+    def test_call_trace_class_with_module(self) -> None:
+        async def run() -> str:
+            result = await mcp_server.mcp.call_tool(
+                "trace_class",
+                {"class_name": "TBHomeViewController", "module": "App", "limit": 10},
+            )
+            return str(result)
+
+        output = asyncio.run(run())
+        self.assertIn("selected_module", output)
+        self.assertIn("ambiguous", output)
+
     def test_read_source_returns_lines(self) -> None:
         async def run() -> str:
             result = await mcp_server.mcp.call_tool(
