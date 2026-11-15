@@ -226,7 +226,7 @@ MCP 是协议，不绑定客户端：OpenCode、Cursor、Claude Code、自研 Ag
 | `find_feature` | 功能/页面检索（中文） |
 | `search_symbol` | 类名/方法名符号检索 |
 | `trace_class` | 类数据流全量视图；同名类返回 `ambiguous`/`candidates`，可传 `module` 消歧 |
-| `search_methods` | 方法体全文检索 |
+| `search_methods` | 方法体全文检索；方法名精确/包含命中优先于「方法体里提到」 |
 | `find_callers` | 调用方 |
 | `impact_analysis` | 影响面分析 |
 | `read_source` | 读源码（带行号，支持 focus） |

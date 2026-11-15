@@ -880,6 +880,9 @@ class QueryService:
         rows: Iterable[sqlite3.Row] = []
         query = (query or "").strip()
         if query:
+            # 多取一些候选：方法名精确命中优先于「方法体里提到这个名字」，
+            # 例如搜 loadQuotesForCategory: 不应先返回调用它的 loadCurrentSection。
+            fetch_limit = min(max(limit * 3, limit), 300)
             for op in ("AND", "OR"):
                 expr = fts_expr(query, op)
                 if not expr:
@@ -891,7 +894,7 @@ class QueryService:
                     WHERE methods_fts MATCH ? {where}
                     ORDER BY rank LIMIT ?
                     """,
-                    (expr, *params, limit),
+                    (expr, *params, fetch_limit),
                 ).fetchall()
                 if rows:
                     break
@@ -903,11 +906,29 @@ class QueryService:
             ).fetchall()
 
         results = []
-        for row in rows:
+        for idx, row in enumerate(rows):
             item = _method_row(row)
             item["score"] = round(-row["rank"], 3) if "rank" in row.keys() and row["rank"] else 0
             item["snippet"] = snippet(row["body_preview"] or row["doc_comment"], query)
+            item["_fts_index"] = idx
             results.append(item)
+
+        if query:
+            needle = "".join(query.lower().split())
+
+            def name_rank(item: dict) -> int:
+                name = "".join((item.get("method_name") or "").lower().split())
+                if not needle or not name:
+                    return 2
+                if name == needle or name.rstrip(":") == needle.rstrip(":"):
+                    return 0
+                return 1 if needle in name else 2
+
+            results.sort(key=lambda it: (name_rank(it), it["_fts_index"]))
+            results = results[:limit]
+
+        for item in results:
+            item.pop("_fts_index", None)
         return {"query": query, "filters": {"class_name": class_name, "module": module},
                 "results": results}
 
