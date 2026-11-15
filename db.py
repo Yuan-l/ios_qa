@@ -532,6 +532,7 @@ def rebuild_classes(conn: sqlite3.Connection, profile: ProjectProfile) -> int:
         )[0]
         protocols: list[str] = []
         properties: list[dict] = []
+        categories: list[str] = []
         modules: set[str] = set()
         languages: set[str] = set()
         header_path = ""
@@ -542,6 +543,8 @@ def rebuild_classes(conn: sqlite3.Connection, profile: ProjectProfile) -> int:
             modules.add(row["module"])
             if row["language"]:
                 languages.add(row["language"])
+            if row["category_name"] and row["category_name"] not in categories:
+                categories.append(row["category_name"])
             for proto in json.loads(row["protocols_json"] or "[]"):
                 if proto and proto not in protocols:
                     protocols.append(proto)
@@ -573,6 +576,7 @@ def rebuild_classes(conn: sqlite3.Connection, profile: ProjectProfile) -> int:
             " ".join(modules),
             base["superclass"],
             " ".join(protocols),
+            " ".join(categories),
             " ".join(f'{p.get("name", "")} {p.get("type", "")}' for p in properties),
             " ".join(method_names[:80]),
             doc,

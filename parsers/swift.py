@@ -49,7 +49,7 @@ TYPE_RE = re.compile(
     r"(?!(?:func|var|let|subscript|init|deinit|case)\b)"
     r"(?P<name>[A-Za-z_]\w*)"
     r"(?P<generic>\s*<[^>{}\n]*>)?"
-    r"(?P<inherit>[^{}\n]*?)\s*\{"
+    r"(?P<inherit>[^{}]{0,400}?)\s*\{"
 )
 
 FUNC_RE = re.compile(
@@ -62,12 +62,12 @@ FUNC_RE = re.compile(
 )
 
 PROP_RE = re.compile(
-    r"(?m)^[ \t]*(?P<attrs>(?:@\w+(?:\([^)]*\))?\s+)*)"
+    r"(?m)^[ \t]*(?P<attrs>(?:@\w+(?:\([^)]*\))?[ \t]+)*)"
     r"(?P<mods>(?:(?:public|private|fileprivate|internal|open|package|final|static|"
-    r"class|override|weak|unowned|lazy|nonisolated)\s+)*)"
-    r"(?:var|let)\s+(?P<name>[A-Za-z_]\w*)"
-    r"\s*(?::\s*(?P<type>[^\n{=]+))?"
-    r"\s*(?:=\s*(?P<init>[A-Z]\w*)\s*\()?"
+    r"class|override|weak|unowned|lazy|nonisolated)[ \t]+)*)"
+    r"(?:var|let)[ \t]+(?P<name>[A-Za-z_]\w*)"
+    r"(?:[ \t]*:[ \t]*(?P<type>[^\n{=]+))?"
+    r"(?:[ \t]*=[ \t]*(?P<init>[A-Z]\w*)[ \t]*\()?"
 )
 
 MESSAGE_CALL_RE = re.compile(r"\b([A-Z]\w*)\.([A-Za-z_]\w*)\s*\(")
@@ -93,12 +93,28 @@ ADD_OBSERVER_BLOCK_RE = re.compile(
 REMOVE_OBSERVER_RE = re.compile(
     r"NotificationCenter\.default\.removeObserver\s*\(\s*self\s*(?:,\s*name:\s*([^,)]+))?"
 )
-PUSH_RE = re.compile(r"pushViewController\s*\(\s*([^,\s)]+)")
-PRESENT_RE = re.compile(r"\bpresent\s*\(\s*([^,\s)]+)")
+PUSH_CALL_RE = re.compile(r"\bpushViewController\s*\(")
+PRESENT_CALL_RE = re.compile(r"\bpresent\s*\(")
 ROOT_RE = re.compile(r"rootViewController\s*:\s*([A-Za-z_]\w*)")
 ROOT_ASSIGN_RE = re.compile(r"rootViewController\s*=\s*([^;\n]+)")
 STRING_URL_RE = re.compile(r'"(https?://[^"\s]+)"')
-SET_VIEW_CONTROLLERS_RE = re.compile(r"setViewControllers\s*\(\s*\[([^\]]*)\]")
+CONTAINER_TYPES = {
+    "UINavigationController", "UITabBarController", "UISplitViewController",
+    "UIPageViewController",
+}
+_CONTAINER_SUFFIXES = (
+    "NavigationController", "TabBarController", "TabbarController",
+    "SplitViewController",
+)
+
+
+def _is_container(name: str) -> bool:
+    return name in CONTAINER_TYPES or name.endswith(_CONTAINER_SUFFIXES)
+
+
+CONTAINER_APPEND_RE = re.compile(r"\bviewControllers\s*\??\s*\.\s*append\s*\(")
+CONTAINER_ASSIGN_RE = re.compile(r"\bviewControllers\s*=\s*\[")
+CONTAINER_SET_RE = re.compile(r"\bsetViewControllers\s*\(")
 
 DECL_KEYWORDS = {
     "func", "var", "let", "subscript", "init", "deinit", "case", "return",
@@ -173,6 +189,38 @@ def _method_at_line(ranges: list[tuple[int, int, str]], line: int) -> str:
 
 def _in_ranges(offset: int, ranges: list[tuple[int, int]]) -> bool:
     return any(start <= offset <= end for start, end in ranges)
+
+
+def _enclosed(
+    text: str, index: int, open_ch: str = "(", close_ch: str = ")", max_len: int = 4000
+) -> str:
+    """返回 ``index`` 处括号内的文本（不含外层括号）；不配对时尽量取到上限。"""
+    if index < 0 or index >= len(text) or text[index] != open_ch:
+        return ""
+    depth = 0
+    end = min(len(text), index + max_len)
+    for i in range(index, end):
+        ch = text[i]
+        if ch == open_ch:
+            depth += 1
+        elif ch == close_ch:
+            depth -= 1
+            if depth == 0:
+                return text[index + 1:i]
+    return text[index + 1:end]
+
+
+def _property_target(raw: str) -> str:
+    """从属性类型里取页面/协议类名：``id<FooDelegate>`` / ``Foo``。"""
+    text = (raw or "").strip()
+    if not text or "->" in text:
+        return ""
+    match = re.search(r"<\s*([A-Z]\w*)\s*>", text)
+    if match:
+        return match.group(1)
+    match = re.fullmatch(r"([A-Z]\w*)", text)
+    return match.group(1) if match else ""
+
 
 
 def parse_swift(text: str, file: SourceFile, profile: ProjectProfile) -> ParseResult:
@@ -323,6 +371,14 @@ def parse_swift(text: str, file: SourceFile, profile: ProjectProfile) -> ParseRe
             )
 
     # ---------- 4. 依赖 / 调用 / API / 通知 / 导航 ----------
+    # 属性可能声明在主类、调用发生在同文件的 extension 里，按类名合并后再解析调用
+    props_by_class: dict[str, list[dict]] = {}
+    for owner in type_ranges:
+        bucket = props_by_class.setdefault(owner["symbol"].class_name, [])
+        for prop in owner["symbol"].properties:
+            if prop not in bucket:
+                bucket.append(prop)
+
     for owner in type_ranges:
         symbol = owner["symbol"]
         body_masked = masked[owner["open"] + 1: owner["end"]]
@@ -341,6 +397,7 @@ def parse_swift(text: str, file: SourceFile, profile: ProjectProfile) -> ParseRe
                 method_ranges,
                 line_map,
                 owner_offset,
+                props_by_class.get(symbol.class_name, []),
             )
         )
         result.api_calls.extend(
@@ -446,6 +503,7 @@ def _parse_calls(
     method_ranges: list[tuple[int, int, str]],
     line_map: LineMap,
     offset: int,
+    properties: list[dict] | None = None,
 ) -> list[CallRec]:
     calls: list[CallRec] = []
     seen: set[tuple[str, str, int]] = set()
@@ -491,6 +549,35 @@ def _parse_calls(
                       "NotificationCenter", "DispatchQueue", "CGRect", "CGSize"}:
             continue
         add(target, "init", "init", "high", match.start())
+
+    # 协议/委托调用：``self.delegate?.foo()`` -> 协议名
+    delegate_props: dict[str, str] = {}
+    block_props: list[str] = []
+    for prop in properties or []:
+        name = (prop.get("name") or "").strip()
+        prop_type = prop.get("type") or ""
+        if not name:
+            continue
+        if "->" in prop_type or prop_type == "block":
+            block_props.append(name)
+        elif "delegate" in name.lower():
+            target = _property_target(prop_type)
+            if target:
+                delegate_props[name] = target
+
+    for name, target in delegate_props.items():
+        pattern = re.compile(
+            rf"\b(?:self\s*\.\s*)?{re.escape(name)}\s*\??\s*\.\s*"
+            r"([A-Za-z_]\w*)\s*\("
+        )
+        for match in pattern.finditer(body_masked):
+            add(target, match.group(1), "delegate", "low", match.start())
+
+    # block 属性调用：``self.onSelect(index)``
+    for name in block_props:
+        pattern = re.compile(rf"\b(?:self\s*\.\s*)?{re.escape(name)}\s*\??\s*\(")
+        for match in pattern.finditer(body_masked):
+            add(class_name, name, "block", "low", match.start())
     return calls
 
 
@@ -647,23 +734,36 @@ def _parse_navigation(
 ) -> list[NavigationRec]:
     navs: list[NavigationRec] = []
     var_map: dict[str, str] = {}
-    for match in re.finditer(
-        r"\b(?:let|var)\s+(\w+)\s*=\s*([A-Z]\w*)\s*\(", body_comments
-    ):
-        var_map[match.group(1)] = match.group(2)
 
-    def resolve(raw: str) -> str:
-        token = raw.strip().strip("[]()")
-        if token in var_map:
-            return var_map[token]
-        # resolve 拿到的是正则捕获的裸类名（``rootViewController: FooViewController()``）
-        if re.fullmatch(r"[A-Z]\w*", token):
-            return token
-        m = re.match(r"([A-Z]\w*)\s*\(", token)
-        return m.group(1) if m else ""
+    def resolve_page(expr: str) -> str:
+        """把表达式收敛成页面类名，优先取局部变量，其次取构造器里的类。"""
+        expr = (expr or "").strip()
+        if not expr:
+            return ""
+        for ident in re.findall(r"[A-Za-z_]\w*", expr):
+            if ident in var_map:
+                return var_map[ident]
+        for match in re.finditer(r"\b([A-Z]\w*)\s*(?:<[^>]*>)?\s*\(", expr):
+            name = match.group(1)
+            if not _is_container(name):
+                return name
+        return ""
+
+    # ``let vc = Foo()`` / ``let nav = UINavigationController(rootViewController: vc)``
+    for match in re.finditer(
+        r"\b(?:let|var)\s+(\w+)\s*=\s*([A-Z]\w*)\s*(?:<[^>]*>)?\s*\(",
+        body_comments,
+    ):
+        var, cls = match.group(1), match.group(2)
+        open_paren = body_comments.find("(", match.start(2))
+        args = _enclosed(body_comments, open_paren) if open_paren >= 0 else ""
+        if _is_container(cls):
+            var_map[var] = resolve_page(args) or cls
+        else:
+            var_map[var] = cls
 
     def add(target: str, kind: str, position: int) -> None:
-        if not target:
+        if not target or _is_container(target):
             return
         navs.append(
             NavigationRec(
@@ -677,15 +777,33 @@ def _parse_navigation(
             )
         )
 
-    for match in PUSH_RE.finditer(body_comments):
-        add(resolve(match.group(1)), "push", match.start())
-    for match in PRESENT_RE.finditer(body_comments):
-        add(resolve(match.group(1)), "present", match.start())
+    for match in PUSH_CALL_RE.finditer(body_comments):
+        add(resolve_page(_enclosed(body_comments, match.end() - 1)), "push", match.start())
+    for match in PRESENT_CALL_RE.finditer(body_comments):
+        add(resolve_page(_enclosed(body_comments, match.end() - 1)), "present", match.start())
     for match in ROOT_RE.finditer(body_comments):
-        add(resolve(match.group(1)), "root", match.start())
+        add(resolve_page(match.group(1)), "root", match.start())
     for match in ROOT_ASSIGN_RE.finditer(body_comments):
-        add(resolve(match.group(1)), "root", match.start())
-    for match in SET_VIEW_CONTROLLERS_RE.finditer(body_comments):
-        for item in re.finditer(r"([A-Z]\w*)\s*\(", match.group(1)):
-            add(item.group(1), "tab", match.start())
+        add(resolve_page(match.group(1)), "root", match.start())
+
+    # tab 容器：``viewControllers?.append(Self.navigationController(with: vc))``
+    for match in CONTAINER_APPEND_RE.finditer(body_comments):
+        args = _enclosed(body_comments, match.end() - 1)
+        add(resolve_page(args), "tab", match.start())
+
+    # tab 容器：``viewControllers = [cameraNav, weatherNav]``
+    for match in CONTAINER_ASSIGN_RE.finditer(body_comments):
+        bracket = body_comments.find("[", match.start(), match.end())
+        items = _enclosed(body_comments, bracket, "[", "]") if bracket >= 0 else ""
+        for item in split_top_level(items):
+            add(resolve_page(item), "tab", match.start())
+
+    # ``setViewControllers([vc1, vc2], animated:)``
+    for match in CONTAINER_SET_RE.finditer(body_comments):
+        args = _enclosed(body_comments, match.end() - 1)
+        bracket = args.find("[")
+        if bracket < 0:
+            continue
+        for item in split_top_level(_enclosed(args, bracket, "[", "]")):
+            add(resolve_page(item), "tab", match.start())
     return navs

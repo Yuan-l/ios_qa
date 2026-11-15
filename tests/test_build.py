@@ -21,6 +21,7 @@ HEADER = """\
 #import <Foundation/Foundation.h>
 
 @interface TBWidget : NSObject
+@property (nonatomic, copy) void (^onReload)(void);
 - (void)reload;
 @end
 """
@@ -31,6 +32,9 @@ IMPL = """\
 @implementation TBWidget
 - (void)reload {
     [[TBWidget shared] reload];
+    if (self.onReload) {
+        self.onReload();
+    }
 }
 + (instancetype)shared { return nil; }
 @end
@@ -106,6 +110,22 @@ class BuildTest(unittest.TestCase):
             self.assertTrue(trace["found"])
             self.assertEqual(trace["superclass_chain"], ["NSObject"])
 
+    def test_header_property_enables_block_calls(self) -> None:
+        build(self.profile, self.db_path, full=True, verbose=False)
+        with QueryService(self.profile, self.db_path) as service:
+            result = service.find_callers("onReload")
+            rows = {(c["caller_class"], c["line"], c["kind"]) for c in result["callers"]}
+            self.assertIn(("TBWidget", 7, "block"), rows)
+
+    def test_header_change_reparses_impl(self) -> None:
+        build(self.profile, self.db_path, full=True, verbose=False)
+        header = self.root / "App" / "TBWidget.h"
+        header.write_text(HEADER + "\n// touched\n", encoding="utf-8")
+
+        report = build(self.profile, self.db_path, verbose=False)
+        # 头文件变了，同目录 .m 也要重解析（block/delegate 属性来自 header）
+        self.assertEqual(report.files_parsed, 2)
+
     def test_qa_roundtrip(self) -> None:
         build(self.profile, self.db_path, full=True, verbose=False)
         with QueryService(self.profile, self.db_path) as service:
@@ -177,7 +197,7 @@ class RealRepoSmokeTest(unittest.TestCase):
                 for hop in path["chain"]
             ]
             self.assertIn(
-                ("AppDelegate", "TBFinanceHomeViewController", "instantiate", 48), hops
+                ("AppDelegate", "TBFinanceHomeViewController", "tab", 52), hops
             )
             self.assertIn(
                 (
@@ -204,6 +224,48 @@ class RealRepoSmokeTest(unittest.TestCase):
                 for row in result["results"]
             }
             self.assertIn(("CameraViewController", "tbLanguageDidChange"), pairs)
+
+    def test_tab_container_navigation(self) -> None:
+        with QueryService(self.profile, self.db_path) as service:
+            result = service.find_navigation("TBInfrastructureDemoViewController")
+            self.assertTrue(result["found"])
+            self.assertTrue(result["reachable"])
+            hops = [
+                (hop["from_class"], hop["to_class"], hop["kind"], hop["line_number"])
+                for path in result["paths"]
+                for hop in path["chain"]
+            ]
+            self.assertIn(
+                ("AppDelegate", "TBInfrastructureDemoViewController", "tab", 60), hops
+            )
+
+    def test_delegate_and_block_dispatch(self) -> None:
+        with QueryService(self.profile, self.db_path) as service:
+            delegate = service.find_callers("CameraCaptureViewModelDelegate.captureOutput")
+            rows = {(c["caller_class"], c["line"]) for c in delegate["callers"]}
+            self.assertIn(("CameraCaptureViewModel", 230), rows)
+
+            block = service.find_callers("onSelect")
+            rows = {(c["caller_class"], c["line"]) for c in block["callers"]}
+            self.assertIn(("TBWeatherCityBar", 129), rows)
+
+    def test_category_attribution(self) -> None:
+        with QueryService(self.profile, self.db_path) as service:
+            found = service.search_symbol("BreadCrumb", limit=10)
+            names = [item["class_name"] for item in found["results"]]
+            self.assertIn("UIViewController", names)
+
+            trace = service.trace_class("UIViewController")
+            categories = {
+                (row["category_name"], row["file_path"])
+                for row in trace["extensions"]
+            }
+            self.assertTrue(
+                any(
+                    name == "BreadCrumb" and path.endswith("UIViewController+BreadCrumb.m")
+                    for name, path in categories
+                )
+            )
 
     def test_synonym_expansion(self) -> None:
         with QueryService(self.profile, self.db_path) as service:

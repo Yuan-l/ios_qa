@@ -270,8 +270,8 @@
           "kind": "navigation_edge",
           "from": "AppDelegate",
           "to": "TBFinanceHomeViewController",
-          "line": 48,
-          "edge_kind": "instantiate"
+          "line": 52,
+          "edge_kind": "tab"
         },
         {
           "kind": "navigation_edge",
@@ -281,7 +281,7 @@
           "edge_kind": "push"
         }
       ],
-      "reason": "行情详情页入口链：tab 内创建是弱边、页面跳转是强边，两者要能连起来",
+      "reason": "行情 tab 在容器里创建、详情页由 push 打开，强边要能连成入口链",
       "last_reviewed": "2026-11-15"
     },
     {
@@ -389,6 +389,106 @@
         }
       ],
       "reason": "英文别名 jank 要能映射到中文卡顿，命中长任务监控",
+      "last_reviewed": "2026-11-15"
+    },
+    {
+      "id": "navigation-infra-tab",
+      "type": "find_navigation",
+      "args": {
+        "target": "TBInfrastructureDemoViewController",
+        "limit": 6
+      },
+      "checks": [
+        {
+          "kind": "navigation_reachable"
+        },
+        {
+          "kind": "navigation_edge",
+          "from": "AppDelegate",
+          "to": "TBInfrastructureDemoViewController",
+          "edge_kind": "tab",
+          "line": 60
+        }
+      ],
+      "reason": "多行类声明 + #if DEBUG 里的 tab 页面也要进索引，否则入口链断",
+      "last_reviewed": "2026-11-15"
+    },
+    {
+      "id": "callers-delegate-dispatch",
+      "type": "find_callers",
+      "args": {
+        "target": "CameraCaptureViewModelDelegate.captureOutput"
+      },
+      "checks": [
+        {
+          "kind": "min_results",
+          "value": 1
+        },
+        {
+          "kind": "file_line_present",
+          "list": "callers",
+          "file_suffix": "CameraCaptureViewModel.swift",
+          "line": 230
+        }
+      ],
+      "reason": "delegate?.captureOutput 必须落到协议名，否则协议方法的调用方全丢",
+      "last_reviewed": "2026-11-15"
+    },
+    {
+      "id": "callers-block-dispatch",
+      "type": "find_callers",
+      "args": {
+        "target": "onSelect",
+        "limit": 20
+      },
+      "checks": [
+        {
+          "kind": "min_results",
+          "value": 4
+        },
+        {
+          "kind": "file_line_present",
+          "list": "callers",
+          "file_suffix": "TBWeatherCityBar.m",
+          "line": 129
+        }
+      ],
+      "reason": "block 属性调用 self.onSelect(index) 要能被 find_callers 找到",
+      "last_reviewed": "2026-11-15"
+    },
+    {
+      "id": "symbol-category",
+      "type": "search_symbol",
+      "args": {
+        "name": "BreadCrumb",
+        "limit": 10
+      },
+      "checks": [
+        {
+          "kind": "class_in_results",
+          "value": "UIViewController"
+        }
+      ],
+      "reason": "ObjC category 名要能反查宿主类（UIViewController+BreadCrumb）",
+      "last_reviewed": "2026-11-15"
+    },
+    {
+      "id": "trace-extension-category",
+      "type": "trace_class",
+      "args": {
+        "class_name": "UIViewController"
+      },
+      "checks": [
+        {
+          "kind": "trace_found"
+        },
+        {
+          "kind": "extension_category",
+          "value": "BreadCrumb",
+          "file_suffix": "UIViewController+BreadCrumb.m"
+        }
+      ],
+      "reason": "trace 要能说清扩展/分类来自哪个 category、哪个文件",
       "last_reviewed": "2026-11-15"
     }
   ]

@@ -25,7 +25,7 @@ python3 -m ios_qa build --check
 # 自检
 python3 -m ios_qa doctor
 
-# 模型无关的 golden 验收（20 个用例，不调用任何 LLM）
+# 模型无关的 golden 验收（25 个用例，不调用任何 LLM）
 python3 -m ios_qa eval
 
 # 查询
@@ -90,21 +90,21 @@ TBRequestManager  (class/objc/TBNetworkManager)
     [components/TBFinanceKit/TBFinanceKit/Classes/Network/TBFinanceHTTP.m:74]
 ```
 
-示例输出（`path`，`low` 表示低置信度的实例化边）：
+示例输出（`path`）：
 
 ```
 TBFinanceDetailViewController  导航  (TBFinanceKit)
 
   路径 1  (入口 AppDelegate / 2 跳)
-    AppDelegate --instantiate(low)--> TBFinanceHomeViewController
-      [TrueDepthDemo2/AppDelegate.swift:48]
+    AppDelegate --tab--> TBFinanceHomeViewController
+      [TrueDepthDemo2/AppDelegate.swift:52]
     TBFinanceHomeViewController --push--> TBFinanceDetailViewController
       [components/TBFinanceKit/TBFinanceKit/Classes/UI/TBFinanceHomeViewController.m:793]
 ```
 
 `path` 只做图上的连通性回溯，不猜类型：强边来自 `navigation`
-（push/present/root/segue），弱边来自 `deps` 的 `instantiate`
-（tab 容器里 `let vc = FooVC()` 这类写法），同一对类已有强边时丢弃弱边。
+（push/present/root/tab/segue），弱边来自 `deps` 的 `instantiate`
+（未能识别的容器写法），同一对类已有强边时丢弃弱边。
 没有连通路径时返回 `incoming` 直接来源，并说明未连通原因。
 
 ---
@@ -218,6 +218,47 @@ FTS5 的 `unicode61` 会把连续中文当成一个 token，`MATCH '首页'` 对
 （部分命中不能和 AND 同分）、方法级 AND 35 / OR 30、入口 70、LIKE 兜底 30；
 VC +4、App 入口 +3。
 
+### 扩展 / 分类归属
+
+- Swift `extension` 与 ObjC category 的方法统一归到**宿主类**
+  （`class_name` = 宿主），来源保留在 `symbols.extension_of` / `category_name`；
+- `trace` 的 `extensions` 字段带 `category_name` / `module` / `language` / 文件行号，
+  CLI 输出新增「扩展/分类」小节；
+- `search_symbol("BreadCrumb")` 能反查 `UIViewController` 并返回 `category` 信息，
+  `find_feature` 的 `search_text` 也包含分类名（搜 `BreadCrumb` 能命中宿主类）；
+- 多行类声明（`final class Foo: Bar,` 换行后 `Baz {`）也能识别——这是
+  `TBInfrastructureDemoViewController` 之前整个文件没进索引的原因。
+
+### 调用解析：协议 / block
+
+- ObjC 实现解析时会读**同目录 `.h`** 的 `@property`：
+  `id<FooDelegate> delegate` + `[self.delegate foo]` →
+  `callee_class=FooDelegate`、`kind=delegate`、`confidence=low`；
+- block 属性（`void (^onSelect)(NSInteger)`）的调用 `self.onSelect(index)`
+  → `kind=block`，能被 `find_callers("onSelect")` 找到；
+- Swift 按类名合并**同文件主类 + extension** 的属性，`delegate?.foo()` /
+  `onSelect?(x)` 同样记录；
+- 头文件变更时，同目录 `.m` / `.mm` 会一起重解析，避免增量索引留下旧调用边。
+
+### tab 容器页面
+
+之前的导航只认 `pushViewController` / `present` / `rootViewController`，
+tab 里创建的页面只能靠 `instantiate` 弱边兜底。现在识别：
+
+```swift
+tabBar.viewControllers?.append(Self.navigationController(with: financeVC))
+viewControllers = [cameraNav, weatherNav]
+setViewControllers([a, b], animated: false)
+```
+
+```objc
+[self setViewControllers:@[nav1, nav2] animated:NO];
+self.viewControllers = @[nav1, nav2];
+```
+
+`UINavigationController` 及其子类（`TBNavigationController` 等）会自动解包到
+内层页面，边类型记为 `tab`（强边）。
+
 ---
 
 ## Profile（换工程只改 JSON）
@@ -270,14 +311,18 @@ python3 -m unittest discover -s ios_qa/tests -v
 - Storyboard 入口与 segue
 - 增量构建幂等、文件修改/删除
 - 中文查询、Q&A 往返
-- 页面入口链：强边（push/root）+ 弱边（instantiate）、未连通时的空结果
+- 页面入口链：强边（push/present/root/tab）+ 弱边（instantiate）、未连通时的空结果
+- tab 容器创建页面（`viewControllers` 赋值 / append / setViewControllers）
 - 通知配对：未配对检测、按名称反查
 - 同义词扩展：报价→行情（保留 Quote 字面命中）、jank→卡顿
+- 协议/block 调用：`delegate?.foo()`、`self.onSelect(x)`，含头文件属性与同文件 extension
+- 扩展/分类归属：`search_symbol("BreadCrumb")`、`trace` 的 `extension_category`
+- 多行类声明、头文件变更触发同目录实现重解析
 - MCP 工具集合与调用返回（14 个工具）
 - `build --check`：通过 / 失败退出码 3 / 无用例跳过 / 不加参数不跑 eval
 - 真实仓库 smoke：规模、`TBRequestManager.h:29`、`TBFinanceHTTP.m:74`、
   `AppDelegate.swift:48 → TBFinanceHomeViewController.m:793` 导航链
-- `run_eval()`：20 个 golden 用例全绿，且每条都带 `last_reviewed`
+- `run_eval()`：25 个 golden 用例全绿，且每条都带 `last_reviewed`
 
 ---
 
@@ -322,7 +367,7 @@ python3 -m ios_qa build --check
 
 | kind | 断言内容 |
 |---|---|
-| `class_in_results` / `min_results` | 结果类名包含 / 至少 N 条 |
+| `class_in_results` / `min_results` | 结果类名包含 / 至少 N 条（results/pages/callers） |
 | `superclass_equals` | 首条结果的父类 |
 | `method_at_line` | 方法名 + 文件后缀 + 行号（`method_name` / `file_suffix` / `line`） |
 | `trace_found` | `trace` 找到目标 |
@@ -336,6 +381,7 @@ python3 -m ios_qa build --check
 | `notification_contains` | 结果含指定 `class` + `name` 的通知 |
 | `summary_gte` | `summary` 某字段 ≥ 期望值 |
 | `synonyms_applied` | 本次检索应用了指定别名对（`from` / `to`） |
+| `extension_category` | `trace` 的扩展列表含指定 category（可加 `file_suffix`） |
 
 ### 维护策略
 
@@ -374,13 +420,15 @@ eval 失败
 | 全量构建耗时 | 约 3~4s（364 文件 / 5.1 万行） |
 | 重复构建 | `files_parsed=0`，计数不变 |
 | 解析失败 | 0 |
-| 索引规模 | 350 类 / 2250 方法 / 4069 调用边 / 1039 依赖边 / 47 导航边 / 21 通知 |
+| 索引规模 | 350 类 / 2257 方法 / 4103 调用边 / 1098 依赖边 / 64 导航边 / 21 通知 |
 | 关键词验证 | 中文 FTS 命中；头文件/实现/调用方行号与源码一致 |
-| 入口路径 | `path TBFinanceDetailViewController` 连通 AppDelegate（弱边）→ 行情首页 → 详情页（push@793） |
+| 入口路径 | `path TBFinanceDetailViewController`：AppDelegate --tab@52--> 行情首页 --push@793--> 详情页 |
 | 通知配对 | 未配对 1 条：`CameraViewController.tbLanguageDidChange`（只注册不移除） |
 | 业务别名 | `报价` 同时命中 `TBFinanceQuote` 与行情页；`jank` → 卡顿 → `TDLongTaskMonitor` |
-| `eval` golden 用例 | **20/20 通过**（不依赖任何模型） |
-| 测试 | 42 个 unittest 全部通过 |
+| 协议/block 调用 | `delegate?.captureOutput` → `CameraCaptureViewModelDelegate`；`onSelect` 4 处 block 调用 |
+| 分类归属 | `search_symbol("BreadCrumb")` 命中 `UIViewController` 等 5 个宿主类 |
+| `eval` golden 用例 | **25/25 通过**（不依赖任何模型） |
+| 测试 | 50 个 unittest 全部通过 |
 
 手动抽查建议：
 
@@ -401,9 +449,10 @@ python3 -m ios_qa notifications --unbalanced
   `confidence` 字段标注 `high/medium/low`；
 - Swift 属性支持显式类型与 `= Foo()` 推断，复杂表达式不展开；
 - 通知配对基于同名注册/移除，RAC / block 观察者标为 `-1`（无法判定）；
-- 页面入口只认 storyboard `initialViewController`、segue、`pushViewController` /
-  `present` 等明确写法；`tabBar.viewControllers?.append(...)` 这类容器创建页面
-  暂未解析，`path` 用 `instantiate` 弱边兜底；
+- 页面入口覆盖 storyboard、segue、push/present/root 与常见 tab 容器写法；
+  自定义工厂函数里间接返回页面、跨文件的 tab 组装仍可能只落到 `instantiate` 弱边；
+- 协议/block 调用只解析同文件属性（ObjC 额外读同目录 `.h`），跨文件 delegate
+  属性仍是启发式，`confidence=low`；
 - 向量检索、相似代码、重复扫描（参考系统的 6 个工具）留到 P3；
 - 不解析 Objective-C++ 模板细节与宏展开。
 
@@ -420,7 +469,7 @@ python3 -m ios_qa notifications --unbalanced
 - **P2-a（已完成）**：补查询面 —— 页面入口路径（`path` / `find_navigation`）、
   通知专项查询（`notifications` / `find_notifications`）、业务同义词
   （`synonyms.json`），golden 扩到 20 条；
-- **P2-b**：解析质量 —— Swift extension / ObjC category 归属、block / 协议方法调用、
-  tab 容器创建页面的导航边；
+- **P2-b（已完成）**：解析质量 —— Swift extension / ObjC category 归属、block / 协议
+  方法调用、tab 容器创建页面的导航边、多行类声明；golden 扩到 25 条；
 - **P2-c**：双 MCP 客户端接入验收（协议层 + 数据层）；
 - **P3**：向量层（`sqlite-vec` 或外部索引）+ 相似代码/重复扫描 + Agent Loom 接入。

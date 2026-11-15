@@ -41,6 +41,7 @@ from ..source import (
     mask_code,
     mask_comments,
     normalize_type,
+    split_top_level,
 )
 from ..textnorm import build_search_text  # noqa: F401  (由 classes 聚合使用)
 
@@ -115,11 +116,54 @@ PUSH_RE = re.compile(r"pushViewController\s*:\s*([^\s\]]+)")
 PRESENT_RE = re.compile(r"presentViewController\s*:\s*([^\s\]]+)")
 ROOT_VC_RE = re.compile(r"rootViewController\s*=\s*([^;]+);")
 INIT_WITH_ROOT_RE = re.compile(r"initWithRootViewController\s*:\s*([^\s\]]+)")
+SET_VIEW_CONTROLLERS_RE = re.compile(r"setViewControllers\s*:\s*@?\[")
+ASSIGN_VIEW_CONTROLLERS_RE = re.compile(r"\.\s*viewControllers\s*=\s*@?\[")
+CONTAINER_TYPES = {
+    "UINavigationController", "UITabBarController", "UISplitViewController",
+    "UIPageViewController",
+}
+_CONTAINER_SUFFIXES = (
+    "NavigationController", "TabBarController", "TabbarController",
+    "SplitViewController",
+)
+
+
+def _is_container(name: str) -> bool:
+    return name in CONTAINER_TYPES or name.endswith(_CONTAINER_SUFFIXES)
 SELECTOR_PART_RE = re.compile(r"(\w+)\s*$")
 
 
 def _clean_literal(raw: str) -> str:
     return raw.strip().strip("@\"").strip('"').strip()
+
+
+def _enclosed(
+    text: str, index: int, open_ch: str = "(", close_ch: str = ")", max_len: int = 4000
+) -> str:
+    """返回 ``index`` 处括号内的文本；不配对时尽量取到上限。"""
+    if index < 0 or index >= len(text) or text[index] != open_ch:
+        return ""
+    depth = 0
+    end = min(len(text), index + max_len)
+    for i in range(index, end):
+        ch = text[i]
+        if ch == open_ch:
+            depth += 1
+        elif ch == close_ch:
+            depth -= 1
+            if depth == 0:
+                return text[index + 1:i]
+    return text[index + 1:end]
+
+
+def _delegate_target(raw: str) -> str:
+    """``id<FooDelegate>`` / ``FooDelegate *`` -> ``FooDelegate``。"""
+    text = (raw or "").strip()
+    match = re.search(r"<\s*([A-Z]\w*)\s*>", text)
+    name = match.group(1) if match else text
+    if name in {"id", "instancetype", "NSObject", "void"}:
+        return ""
+    return name if re.fullmatch(r"[A-Z]\w*", name) else ""
 
 
 def _selector_from_signature(signature: str) -> str:
@@ -393,7 +437,7 @@ def _parse_header_methods(
 
 
 def parse_implementation(
-    text: str, file: SourceFile, profile: ProjectProfile
+    text: str, file: SourceFile, profile: ProjectProfile, header_text: str = ""
 ) -> ParseResult:
     result = ParseResult()
     masked = mask_code(text, "objc")
@@ -449,6 +493,13 @@ def parse_implementation(
 
         # 类扩展里的 @property
         properties = _parse_properties(body_masked)
+        if header_text:
+            # 头文件里的属性（尤其是 block / delegate）对调用解析很重要
+            known = {prop["name"] for prop in properties}
+            for prop in _parse_properties(mask_code(header_text, "objc")):
+                if prop["name"] not in known:
+                    properties.append(prop)
+                    known.add(prop["name"])
         for prop in properties:
             dep_type = prop.get("type", "")
             if profile.is_own_class(dep_type):
@@ -462,7 +513,9 @@ def parse_implementation(
             _parse_impl_deps(body_masked, class_name, file, profile, line_map, impl_start)
         )
         result.calls.extend(
-            _parse_calls(body_masked, class_name, file, ranges, line_map, impl_start)
+            _parse_calls(
+                body_masked, class_name, file, ranges, line_map, impl_start, properties
+            )
         )
         result.api_calls.extend(
             _parse_api_calls(
@@ -594,6 +647,7 @@ def _parse_calls(
     ranges: list[tuple[int, int, str]],
     line_map: LineMap,
     offset: int,
+    properties: list[dict] | None = None,
 ) -> list[CallRec]:
     calls: list[CallRec] = []
     seen: set[tuple[str, str, int]] = set()
@@ -658,6 +712,74 @@ def _parse_calls(
                 line_number=line,
             )
         )
+
+    # 委托调用：``[self.delegate foo:]`` -> 协议名
+    delegate_props: dict[str, str] = {}
+    block_props: list[str] = []
+    for prop in properties or []:
+        name = (prop.get("name") or "").strip()
+        prop_type = prop.get("type") or ""
+        if not name:
+            continue
+        if prop_type == "block":
+            block_props.append(name)
+        elif "delegate" in name.lower():
+            target = _delegate_target(prop_type)
+            if target:
+                delegate_props[name] = target
+
+    for name, target in delegate_props.items():
+        pattern = re.compile(
+            rf"\[\s*(?:self\s*\.\s*|_\s*)?{re.escape(name)}\s+([A-Za-z_]\w*)"
+        )
+        for match in pattern.finditer(body_masked):
+            line = line_map.line_of(offset + match.start())
+            caller = _method_at_line(ranges, line)
+            if not caller:
+                continue
+            key = (target, match.group(1), line)
+            if key in seen:
+                continue
+            seen.add(key)
+            calls.append(
+                CallRec(
+                    caller_class=class_name,
+                    caller_method=caller,
+                    callee_class=target,
+                    callee_name=match.group(1),
+                    kind="delegate",
+                    confidence="low",
+                    module=file.module,
+                    file_path=file.rel_path,
+                    line_number=line,
+                )
+            )
+
+    # block 属性调用：``self.onSelect(index)``
+    for name in block_props:
+        pattern = re.compile(rf"\b(?:self\s*\.\s*|_\s*)?{re.escape(name)}\s*\(")
+        for match in pattern.finditer(body_masked):
+            line = line_map.line_of(offset + match.start())
+            caller = _method_at_line(ranges, line)
+            if not caller:
+                continue
+            key = (class_name, name, line)
+            if key in seen:
+                continue
+            seen.add(key)
+            calls.append(
+                CallRec(
+                    caller_class=class_name,
+                    caller_method=caller,
+                    callee_class=class_name,
+                    callee_name=name,
+                    kind="block",
+                    confidence="low",
+                    module=file.module,
+                    file_path=file.rel_path,
+                    line_number=line,
+                )
+            )
     return calls
 
 
@@ -826,22 +948,39 @@ def _parse_navigation(
 ) -> list[NavigationRec]:
     navs: list[NavigationRec] = []
     var_map: dict[str, str] = {}
-    for match in VAR_CLASS_RE.finditer(body_comments):
-        cls = match.group(3) or match.group(4)
-        var_map[match.group(2)] = cls
 
-    def resolve(arg: str) -> str:
-        arg = arg.strip().strip("[]").strip()
-        if arg in var_map:
-            return var_map[arg]
-        m = re.search(r"\b([A-Z]\w+)\s*(?:alloc|new|init)", arg)
-        if m:
-            return m.group(1)
-        m = re.search(r"\b([A-Z]\w*ViewController)\b", arg)
-        return m.group(1) if m else ""
+    def resolve(expr: str) -> str:
+        expr = expr.strip().strip("@[]").strip()
+        if not expr:
+            return ""
+        for ident in re.findall(r"[A-Za-z_]\w*", expr):
+            if ident in var_map:
+                return var_map[ident]
+        inner = re.search(r"initWithRootViewController\s*:\s*(\w+)", expr)
+        if inner and inner.group(1) in var_map:
+            return var_map[inner.group(1)]
+        for match in re.finditer(r"\b([A-Z]\w*)\s*(?:alloc|new|init)", expr):
+            name = match.group(1)
+            if not _is_container(name):
+                return name
+        match = re.search(r"\b([A-Z]\w*ViewController)\b", expr)
+        return match.group(1) if match else ""
+
+    # ``UINavigationController *nav = [[UINavigationController alloc]
+    #   initWithRootViewController:vc]`` -> nav 指向 vc
+    for match in VAR_CLASS_RE.finditer(body_comments):
+        var = match.group(2)
+        cls = match.group(3) or match.group(4)
+        if _is_container(cls):
+            end = body_comments.find(";", match.end())
+            tail = body_comments[match.end(): end if end >= 0 else match.end() + 300]
+            inner = re.search(r"initWithRootViewController\s*:\s*(\w+)", tail)
+            var_map[var] = var_map.get(inner.group(1), "") if inner else ""
+        else:
+            var_map[var] = cls
 
     def add(target: str, kind: str, line: int, identifier: str = "") -> None:
-        if not target:
+        if not target or _is_container(target):
             return
         navs.append(
             NavigationRec(
@@ -863,6 +1002,15 @@ def _parse_navigation(
         add(resolve(match.group(1)), "root", line_map.line_of(offset + match.start()))
     for match in ROOT_VC_RE.finditer(body_comments):
         add(resolve(match.group(1)), "root", line_map.line_of(offset + match.start()))
+
+    # tab 容器：``[self setViewControllers:@[nav1, nav2] animated:NO]``
+    #           ``self.viewControllers = @[nav1, nav2]``
+    for pattern in (SET_VIEW_CONTROLLERS_RE, ASSIGN_VIEW_CONTROLLERS_RE):
+        for match in pattern.finditer(body_comments):
+            bracket = body_comments.find("[", match.start(), match.end())
+            items = _enclosed(body_comments, bracket, "[", "]") if bracket >= 0 else ""
+            for item in split_top_level(items):
+                add(resolve(item), "tab", line_map.line_of(offset + match.start()))
     return navs
 
 
@@ -870,7 +1018,9 @@ def _line_snippet(line: int, line_map: LineMap) -> str:
     return line_map.line_text(line).strip()
 
 
-def parse_file(text: str, file: SourceFile, profile: ProjectProfile) -> ParseResult:
+def parse_file(
+    text: str, file: SourceFile, profile: ProjectProfile, header_text: str = ""
+) -> ParseResult:
     if file.suffix == ".h":
         return parse_header(text, file, profile)
-    return parse_implementation(text, file, profile)
+    return parse_implementation(text, file, profile, header_text=header_text)

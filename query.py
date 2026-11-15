@@ -382,6 +382,42 @@ class QueryService:
             if cls:
                 add(cls, 55 if method["method_name"] == name else 40, "method")
 
+        # 分类 / 扩展名（``UIViewController+BreadCrumb``）也能被搜到
+        category_rows = self.conn.execute(
+            """
+            SELECT class_name, category_name, kind, language, file_path, line_start
+            FROM symbols
+            WHERE category_name LIKE ? COLLATE NOCASE
+            ORDER BY LENGTH(category_name), class_name LIMIT ?
+            """,
+            (f"%{name}%", limit * 3),
+        ).fetchall()
+        for symbol in category_rows:
+            key = symbol["class_name"]
+            item = scores.get(key)
+            if item is None:
+                cls = self.conn.execute(
+                    "SELECT * FROM classes WHERE class_name = ?", (key,)
+                ).fetchone()
+                if cls is None:
+                    continue
+                item = {
+                    **_class_row(cls, detail=True),
+                    "score": 70 if symbol["category_name"].lower() == name.lower() else 50,
+                    "matched_on": "category",
+                }
+                scores[key] = item
+            item.setdefault(
+                "category",
+                {
+                    "name": symbol["category_name"],
+                    "kind": symbol["kind"],
+                    "language": symbol["language"],
+                    "file_path": symbol["file_path"],
+                    "line_start": symbol["line_start"],
+                },
+            )
+
         results = sorted(scores.values(), key=lambda x: (-x["score"], x["class_name"]))[:limit]
         for item in results:
             item["methods"] = self._top_methods(item["class_name"], 30)
@@ -482,6 +518,10 @@ class QueryService:
         extensions = [
             {
                 "kind": r["kind"],
+                "category_name": r["category_name"],
+                "extension_of": r["extension_of"],
+                "language": r["language"],
+                "module": r["module"],
                 "file_path": r["file_path"],
                 "line_start": r["line_start"],
                 "superclass": r["superclass"],
@@ -769,7 +809,7 @@ class QueryService:
         limit = max(1, min(int(limit), 50))
         empty = {
             "target": target, "found": False, "reachable": False, "entrypoints": [],
-            "roots": [], "paths": [], "incoming": [], "outgoing": [],
+            "roots": [], "paths": [], "incoming": [], "outgoing": [], "weak_edges": 0,
         }
         if not target:
             return empty

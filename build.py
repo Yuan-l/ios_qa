@@ -136,8 +136,28 @@ def build(
 
     current_paths = {file.rel_path for file in files}
     deleted = [p for p in existing if p not in current_paths]
-    report.files_skipped = len(unchanged)
     report.files_deleted = len(deleted)
+
+    # 头文件变更会改变同目录 .m 的解析结果（属性、block/delegate 类型），
+    # 因此把对应实现也纳入本次重解析，避免增量索引留下旧调用边。
+    by_path = {file.rel_path: file for file in files}
+    changed_paths = {file.rel_path for file in changed}
+    extra: list[SourceFile] = []
+    for file in changed:
+        if file.suffix != ".h":
+            continue
+        stem = file.rel_path[:-len(file.suffix)]
+        for suffix in (".m", ".mm"):
+            rel_path = stem + suffix
+            sibling = by_path.get(rel_path)
+            if sibling and rel_path not in changed_paths:
+                changed_paths.add(rel_path)
+                extra.append(sibling)
+    if extra:
+        changed.extend(extra)
+        extra_paths = {file.rel_path for file in extra}
+        unchanged = [file for file in unchanged if file.rel_path not in extra_paths]
+    report.files_skipped = len(unchanged)
 
     # 删除已不存在的文件
     with conn:

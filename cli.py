@@ -250,6 +250,11 @@ def cmd_trace(args) -> int:
         f"{m['signature']}   [{m['file_path']}:{m['line_start']}-{m['line_end']}]"
         for m in data["methods"]
     ])
+    _section("扩展/分类", [
+        f"{e['kind']} {e['category_name'] or e['extension_of']}  "
+        f"{e['module']}/{e['language']}  [{e['file_path']}:{e['line_start']}]"
+        for e in data.get("extensions", [])
+    ])
     _section("依赖", [
         f"{d['dep_class']}  ({d['dep_kind']})  [{d['file_path']}:{d['line']}]"
         for d in data["deps"]

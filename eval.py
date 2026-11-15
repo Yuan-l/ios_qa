@@ -94,7 +94,13 @@ def _check(data: dict, spec: dict) -> tuple[bool, str]:
         return ok, f"{spec['value']} in {names[:8]}"
 
     if kind == "min_results":
-        rows = data.get("results") or data.get("pages") or []
+        rows = (
+            data.get("results")
+            or data.get("pages")
+            or data.get("callers")
+            or data.get("methods")
+            or []
+        )
         ok = len(rows) >= int(spec["value"])
         return ok, f"count={len(rows)} >= {spec['value']}"
 
@@ -125,14 +131,15 @@ def _check(data: dict, spec: dict) -> tuple[bool, str]:
     if kind == "file_line_present":
         rows = data.get(spec.get("list", ""), [])
         for row in rows:
-            line = row.get("line", row.get("line_number", 0))
+            line = row.get("line", row.get("line_number", row.get("line_start", 0)))
             if (
                 row.get("file_path", "").endswith(spec["file_suffix"])
                 and int(line or 0) == int(spec["line"])
             ):
                 return True, f"{spec['file_suffix']}:{spec['line']}"
         actual = sorted({
-            f"{Path(row.get('file_path', '')).name}:{row.get('line', row.get('line_number', 0))}"
+            f"{Path(row.get('file_path', '')).name}:"
+            f"{row.get('line', row.get('line_number', row.get('line_start', 0)))}"
             for row in rows
         })
         return False, f"missing {spec['file_suffix']}:{spec['line']}; got {actual[:6]}"
@@ -216,6 +223,24 @@ def _check(data: dict, spec: dict) -> tuple[bool, str]:
         pairs = {(item.get("from"), item.get("to")) for item in data.get("synonyms") or []}
         ok = (spec["from"], spec["to"]) in pairs
         return ok, f"synonyms={sorted(pairs)}"
+
+    if kind == "extension_category":
+        for row in data.get("extensions", []):
+            if row.get("category_name") != spec["value"]:
+                continue
+            if "file_suffix" in spec and not row.get("file_path", "").endswith(
+                spec["file_suffix"]
+            ):
+                continue
+            return True, (
+                f"category {spec['value']} at "
+                f"{row.get('file_path')}:{row.get('line_start')}"
+            )
+        actual = [
+            (row.get("category_name"), row.get("file_path"))
+            for row in data.get("extensions", [])
+        ]
+        return False, f"missing category {spec['value']}; got {actual[:6]}"
 
     raise ValueError(f"未知断言: {kind}")
 

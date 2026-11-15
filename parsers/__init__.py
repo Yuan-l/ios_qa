@@ -23,7 +23,16 @@ def parse_file(file: SourceFile, profile: ProjectProfile, text: str | None = Non
     if not text:
         return ParseResult()
     if file.language == "objc":
-        return objc.parse_file(text, file, profile)
+        header_text = ""
+        if file.suffix in {".m", ".mm"}:
+            # 头文件里的 block / delegate 属性决定调用能否落到具体协议
+            header = file.path.with_suffix(".h")
+            if header.is_file():
+                try:
+                    header_text = header.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    header_text = ""
+        return objc.parse_file(text, file, profile, header_text=header_text)
     if file.language == "swift":
         return swift.parse_swift(text, file, profile)
     if file.language == "ui":

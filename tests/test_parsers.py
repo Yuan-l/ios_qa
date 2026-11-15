@@ -113,6 +113,45 @@ class ObjCTest(ParserTestBase):
         call = next(c for c in result.calls if c.callee_name == "get")
         self.assertIn("TBRequestManager", lines[call.line_number - 1])
 
+    def test_block_and_delegate_calls_from_header(self) -> None:
+        header = """\
+#import <Foundation/Foundation.h>
+@protocol TBWidgetDelegate <NSObject>
+- (void)widgetDidSelect:(NSInteger)index;
+@end
+
+@interface TBWidget : NSObject
+@property (nonatomic, copy) void (^onSelect)(NSInteger index);
+@property (nonatomic, weak) id<TBWidgetDelegate> delegate;
+@end
+"""
+        impl = """\
+#import "TBWidget.h"
+
+@implementation TBWidget
+
+- (void)tapped:(NSInteger)index {
+    if (self.onSelect) {
+        self.onSelect(index);
+    }
+    [self.delegate widgetDidSelect:index];
+}
+
+@end
+"""
+        source = make_source(self.root, "TBWidget.m", impl)
+        result = objc.parse_implementation(
+            impl, source, self.profile, header_text=header
+        )
+        block = next(c for c in result.calls if c.kind == "block")
+        self.assertEqual((block.callee_class, block.callee_name), ("TBWidget", "onSelect"))
+        self.assertEqual(block.line_number, 7)
+
+        delegate = next(c for c in result.calls if c.kind == "delegate")
+        self.assertEqual(delegate.callee_class, "TBWidgetDelegate")
+        self.assertEqual(delegate.callee_name, "widgetDidSelect")
+        self.assertEqual(delegate.line_number, 9)
+
 
 class SwiftTest(ParserTestBase):
     SOURCE = """\
@@ -195,6 +234,72 @@ final class TBHomeViewController: UIViewController {}
         urls = {a.url_pattern for a in result.api_calls}
         self.assertIn("https://example.com/api/home", urls)
         self.assertTrue(all("\n" not in u for u in urls))
+
+    def test_tab_container_and_multiline_class(self) -> None:
+        text = """\
+final class TBAppDelegate: UIResponder,
+    UIApplicationDelegate {
+    func application() -> Bool {
+        let tab = TBTabbarViewController()
+        let home = TBHomeViewController()
+        tab.viewControllers?.append(UINavigationController(rootViewController: home))
+        let detail = TBDetailViewController()
+        tab.viewControllers = [UINavigationController(rootViewController: detail)]
+        return true
+    }
+}
+
+final class TBTabbarViewController: UITabBarController {}
+
+final class TBHomeViewController: UIViewController {}
+
+final class TBDetailViewController: UIViewController {}
+"""
+        source = make_source(self.root, "TBAppDelegate.swift", text)
+        result = swift.parse_swift(text, source, self.profile)
+        app = next(s for s in result.symbols if s.class_name == "TBAppDelegate")
+        self.assertEqual(app.superclass, "UIResponder")
+        self.assertIn("UIApplicationDelegate", app.protocols)
+
+        tab_targets = {(n.to_class, n.line_number) for n in result.navigation if n.kind == "tab"}
+        self.assertIn(("TBHomeViewController", 6), tab_targets)
+        self.assertIn(("TBDetailViewController", 8), tab_targets)
+
+    def test_delegate_and_block_dispatch(self) -> None:
+        text = """\
+protocol TBHomeDelegate: AnyObject {
+    func didSelect(index: Int)
+}
+
+final class TBHomeViewController: UIViewController {
+    weak var delegate: TBHomeDelegate?
+    var onSelect: ((Int) -> Void)?
+
+    func select(index: Int) {
+        delegate?.didSelect(index: index)
+        onSelect?(index)
+    }
+}
+
+extension TBHomeViewController {
+    func reload() {
+        self.delegate?.didSelect(index: 0)
+    }
+}
+"""
+        source = make_source(self.root, "TBHomeViewController.swift", text)
+        result = swift.parse_swift(text, source, self.profile)
+        delegates = [c for c in result.calls if c.kind == "delegate"]
+        self.assertEqual(
+            {(c.callee_class, c.callee_name) for c in delegates},
+            {("TBHomeDelegate", "didSelect")},
+        )
+        # 主类 + 同文件 extension 都要能解析（属性声明在主类）
+        self.assertEqual({c.line_number for c in delegates}, {10, 17})
+
+        block = next(c for c in result.calls if c.kind == "block")
+        self.assertEqual((block.callee_class, block.callee_name), ("TBHomeViewController", "onSelect"))
+        self.assertEqual(block.line_number, 11)
 
 
 class UITest(ParserTestBase):
