@@ -1,5 +1,9 @@
 # ios_qa — iOS 静态解析 + 知识库（P1 / P2 / P3）
 
+> **仓库边界**：这是**工具仓库**，只放代码、默认模板和测试。
+> 被解析的 iOS 工程不在这里——它的配置、golden、同义词、索引都放在工程自己的
+> `<工程根>/.ios_qa/` 下。同一份工具可以服务任意多个 iOS 工程，互不干扰。
+
 纯 Python 词法扫描，把 iOS 工程解析成 SQLite 结构化索引，提供：
 
 - **结构化索引**：类/协议/扩展、方法体、依赖、调用边、页面入口、跳转、通知、API 端点
@@ -13,12 +17,34 @@
 
 ---
 
+## 安装
+
+```bash
+# 只装构建/查询/MCP（除 MCP SDK 外全用标准库）
+python3 -m pip install -e /path/to/ios_qa
+
+# 需要语义检索时再装可选依赖（Qdrant 本地模式 + fastembed/ONNX）
+python3 -m pip install -e "/path/to/ios_qa[vectors]"
+```
+
+装好后命令在**任何目录**都可用；也可以不安装，用
+`PYTHONPATH=/path/to/ios_qa python3 -m ios_qa ...` 直接跑源码。
+
+---
+
 ## 快速开始
 
 ```bash
-cd /path/to/TrueDepthDemo2
+cd /path/to/YourApp
 
-# 构建索引（首次全量约 3~7 秒；之后按文件 sha256 增量）
+# 1. 初始化工程配置（模板在 ios_qa 仓库 templates/）
+mkdir -p .ios_qa
+cp /path/to/ios_qa/templates/project.json     .ios_qa/project.json
+cp /path/to/ios_qa/templates/synonyms.json    .ios_qa/synonyms.json
+cp /path/to/ios_qa/templates/eval_cases.json  .ios_qa/eval_cases.json
+# 然后按工程改 project.json 的 name / source_dirs / own_class_patterns
+
+# 2. 构建索引（首次全量约 3~7 秒；之后按文件 sha256 增量）
 python3 -m ios_qa build
 
 # 构建 + 自动跑 golden 自检（失败退出码 3）
@@ -27,7 +53,7 @@ python3 -m ios_qa build --check
 # 自检
 python3 -m ios_qa doctor
 
-# 模型无关的 golden 验收（31 个用例，不调用任何 LLM）
+# 模型无关的 golden 验收（不调用任何 LLM）
 python3 -m ios_qa eval
 
 # MCP 双客户端验收（协议层 + 数据层，失败退出码 1）
@@ -53,16 +79,51 @@ python3 -m ios_qa semantic "行情页面怎么加载数据"
 python3 -m ios_qa similar TBAlphaView.setupLayout --mode semantic
 ```
 
-索引默认落在 `ios_qa/.data/ios_qa.db`（已加入 `.gitignore`）；向量索引与
-embedding 缓存分别落在同目录的 `qdrant_storage/` 和 `embedding_cache.db`。
+工程内目录布局：
+
+```text
+YourApp/
+├── .ios_qa/                     # 工程专属，全部由本工具读写
+│   ├── project.json             #   profile：扫描范围、类前缀、跳过规则
+│   ├── eval_cases.json          #   golden 用例（建议提交）
+│   ├── synonyms.json            #   业务别名分组（建议提交）
+│   ├── ios_qa.db                #   SQLite 索引（可随时重建，gitignore）
+│   ├── embedding_cache.db       #   向量缓存（可随时重建，gitignore）
+│   └── qdrant_storage/          #   Qdrant 本地持久化（可随时重建，gitignore）
+├── YourApp/
+└── components/
+```
+
+工程根目录的 `.gitignore` 建议加：
+
+```gitignore
+.ios_qa/*.db
+.ios_qa/*.db-shm
+.ios_qa/*.db-wal
+.ios_qa/embedding_cache.db
+.ios_qa/qdrant_storage/
+```
+
+### 多工程
+
+每个工程一个 `.ios_qa/`，工具仓库不保存任何工程的配置或数据：
+
+```bash
+cd ~/work/AppA && python3 -m ios_qa build      # 用 ~/work/AppA/.ios_qa/
+cd ~/work/AppB && python3 -m ios_qa build      # 用 ~/work/AppB/.ios_qa/
+
+# 不在工程目录时用 --root 或环境变量指定
+python3 -m ios_qa --root ~/work/AppA info
+IOS_QA_ROOT=~/work/AppA python3 -m ios_qa build
+```
 
 ### 常用参数
 
 | 参数 | 说明 |
 |---|---|
-| `--root <dir>` | 工程根目录，默认包所在目录 |
-| `--db <path>` | SQLite 路径 |
-| `--profile <json>` | 自定义 project.json |
+| `--root <dir>` | 工程根目录；默认 `$IOS_QA_ROOT`，否则当前目录 |
+| `--db <path>` | SQLite 路径，默认 `<root>/.ios_qa/ios_qa.db` |
+| `--profile <json>` | 自定义 project.json，默认 `<root>/.ios_qa/project.json` |
 | `--json` | 机器可读输出 |
 
 `build --full` 忽略哈希全量重建；`build --quiet` 不打印进度。
@@ -135,7 +196,7 @@ TBFinanceDetailViewController  导航  (TBFinanceKit)
 MCP 是协议，不绑定客户端：OpenCode、Cursor、Claude Code、自研 Agent Loom，
 只要支持 stdio MCP 就能接。索引与查询层不感知模型。
 
-复制 `ios_qa/mcp.json.example` 到工程根目录并改名为 `.mcp.json`，
+复制 `mcp.json.example` 到工程根目录并改名为 `.mcp.json`，
 或合并进已有客户端配置（字段名以客户端为准）：
 
 ```json
@@ -144,11 +205,18 @@ MCP 是协议，不绑定客户端：OpenCode、Cursor、Claude Code、自研 Ag
     "ios_qa": {
       "command": "python3",
       "args": ["-m", "ios_qa", "mcp"],
-      "cwd": "/absolute/path/to/TrueDepthDemo2"
+      "cwd": "/absolute/path/to/YourApp",
+      "env": {
+        "IOS_QA_ROOT": "/absolute/path/to/YourApp"
+      }
     }
   }
 }
 ```
+
+`cwd` 必须指向**目标 iOS 工程**（`cwd` 里包含 `.ios_qa/`），不要指向工具仓库；
+`IOS_QA_ROOT` 是同一件事的显式写法，客户端不保证启动目录时更稳妥。
+接多个工程就配多个 server 条目，各自指向不同工程。
 
 提供的工具：
 
@@ -203,7 +271,7 @@ python3 -m ios_qa mcp-smoke --json          # CI 消费
 退出码：`0` 通过 / `1` 协议或数据不一致 / `2` 索引不存在。
 
 ```text
-MCP 验收：TrueDepthDemo2  (ios_qa/.data/ios_qa.db)
+MCP 验收：TrueDepthDemo2  (.ios_qa/ios_qa.db)
 
 协议层
   ✅ raw-jsonrpc  18 个工具  服务端 ios_qa / 协议 2024-11-05
@@ -229,13 +297,12 @@ MCP 验收：TrueDepthDemo2  (ios_qa/.data/ios_qa.db)
 ## 架构
 
 ```
-ios_qa/
+ios_qa/                包（pip 安装的模块）
 ├── config.py          Profile：所有项目差异（目录、类前缀、HTTP 门面、VC 基类）
 ├── discover.py        源码发现、目录/文件过滤、sha256
 ├── source.py          注释/字符串屏蔽、括号配对、行号换算、URL 清洗、UI 文案提取
 ├── textnorm.py        CJK 单字+bigram、驼峰拆词、FTS 表达式
 ├── synonyms.py        业务别名加载与查询扩展
-├── synonyms.json      业务别名分组（行情/报价、崩溃/crash …）
 ├── model.py           SymbolRec / MethodRec / DepRec / CallRec ...
 ├── parsers/
 │   ├── objc.py        .h/.m/.mm：interface/category/协议/方法体/通知/导航
@@ -252,6 +319,14 @@ ios_qa/
 ├── mcp_server.py      FastMCP 适配层
 ├── mcp_smoke.py       MCP 双客户端验收（stdlib JSON-RPC + 官方 SDK）
 └── tests/             unittest
+
+templates/             工程侧配置模板（复制到 <工程>/.ios_qa/）
+├── project.json
+├── synonyms.json
+└── eval_cases.json
+
+pyproject.toml         可 pip install -e 的打包配置
+mcp.json.example       MCP 客户端配置示例
 ```
 
 ### 数据表
@@ -266,7 +341,7 @@ ios_qa/
 FTS5 虚表：
 `classes_fts`、`methods_fts`、`qa_fts`（全量重建，数据量级下成本可接受）
 
-语义索引（同级 `.data/` 下，均 gitignored）：
+语义索引（与数据库同在 `<工程>/.ios_qa/` 下，均 gitignored）：
 `qdrant_storage/`（collection `methods`，dense 512 维 + sparse BM42）、
 `embedding_cache.db`（`cache` 稠密 / `sparse_cache` 稀疏）、
 `qdrant_storage/build_meta.json`、`qdrant_storage/file_hashes.json`
@@ -421,7 +496,7 @@ $ python3 -m ios_qa duplicates --min-lines 10 --limit 1
 - 一组重复用并查集聚成连通分量，`kind=exact` 要求全组哈希相同，
   否则 `near` 且 `similarity` 取组内最低的复核值；跨模块的组会标
   `cross_module=true`；
-- 实测本仓库：1459 个指纹 / 约 0.76 MB blob，全量计算约 1.6s；
+- 实测本工程：1461 个指纹 / 约 0.76 MB blob，全量计算约 1.6s；
   `duplicates` 查询约 0.1s。
 
 已知边界：改名、改注释、换字面量都还能命中；**换一种实现思路**（结构不同）
@@ -484,7 +559,7 @@ python3 -m ios_qa similar-snippet SomeSnippet.m --min-similarity 0.9
 
 ```text
 $ python3 -m ios_qa semantic "相机拍照后怎么保存图片"
-语义检索「相机拍照后怎么保存图片」  rrf  索引 1505 个方法
+语义检索「相机拍照后怎么保存图片」  rrf  索引 1507 个方法
 1. 0.833  TBSuperResolutionViewController.saveTapped  [MyCameraModule]
    components/MyCameraModule/ViewController/TBSuperResolutionViewController.swift:...
 2. 0.625  MainCameraEditViewController.saveImageToTempDirectory  [MyCameraModule]
@@ -503,7 +578,7 @@ $ python3 -m ios_qa semantic "相机拍照后怎么保存图片"
 - Qdrant 本地模式有目录锁：同一个 `qdrant_storage` 不能并发开两个 client，
   `QueryService.close()` 会按顺序关闭 store / 缓存 / SQLite。
 
-实测本仓库：1959 个有方法体的方法 → 1505 个可向量化；`vectors --full`
+实测本工程：1961 个有方法体的方法 → 1507 个可向量化；`vectors --full`
 222.5s（首次含模型加载），增量 2~4s（0~41 个 point）；语义查询约 0.3~1s。
 已知限制：BGE-small-zh 是通用中文小模型，中文 query → ObjC 方法体的召回
 不总是精确，类名/方法名明确时仍应优先用 `find_feature` / `search_methods`。
@@ -512,7 +587,7 @@ $ python3 -m ios_qa semantic "相机拍照后怎么保存图片"
 
 ## Profile（换工程只改 JSON）
 
-`ios_qa/project.json` 示例字段：
+配置放在**工程内**的 `.ios_qa/project.json`（模板：`templates/project.json`）。示例字段：
 
 | 字段 | 说明 |
 |---|---|
@@ -549,8 +624,12 @@ $ python3 -m ios_qa semantic "相机拍照后怎么保存图片"
 ## 测试
 
 ```bash
-python3 -m unittest discover -s ios_qa/tests -v
+# 在任意 iOS 工程根目录跑：真实仓库冒烟测试会自动使用当前工程的 .ios_qa/project.json
+python3 -m unittest discover -s /path/to/ios_qa/ios_qa/tests -t /path/to/ios_qa -v
 ```
+
+当前目录没有 `.ios_qa/project.json` 时，`RealRepoSmokeTest` 会整类跳过，
+其余 90+ 个用例照常运行（它们用临时目录造小型 ObjC/Swift 工程）。
 
 覆盖：
 
@@ -583,7 +662,7 @@ python3 -m unittest discover -s ios_qa/tests -v
 
 ## Golden 用例（`eval`）
 
-`eval_cases.json` 是对**当前真实仓库**的端到端断言：问什么 → 必须返回哪个类、
+`eval_cases.json`（工程内 `.ios_qa/eval_cases.json`）是对**当前真实工程**的端到端断言：问什么 → 必须返回哪个类、
 哪个文件、第几行。它不调用任何 LLM，任何 MCP 客户端拿到的都是同一份数据。
 
 ```bash
@@ -601,7 +680,7 @@ python3 -m ios_qa eval --json                       # CI 消费
 python3 -m ios_qa build --check
 ```
 
-- 只读当前工程的 `ios_qa/eval_cases.json`；不存在时打印「跳过 eval 自检」，不影响构建；
+- 只读当前工程的 `.ios_qa/eval_cases.json`；不存在时打印「跳过 eval 自检」，不影响构建；
 - 输出只列失败用例，通过时只打一行汇总；
 - 退出码：`0` 正常 / `1` 有文件解析失败 / `3` golden 有失败；
   解析失败优先（`1`），避免两种问题混在一起；
@@ -683,8 +762,8 @@ eval 失败
 | 全量构建耗时 | 约 6s（364 文件 / 5.1 万行，含代码指纹） |
 | 重复构建 | `files_parsed=0`，计数不变 |
 | 解析失败 | 0 |
-| 索引规模 | 352 类 / 2278 方法（1959 有方法体）/ 4153 调用边 / 1107 依赖边 / 64 导航边 / 21 通知 |
-| 代码指纹 | 1459 个方法（约 0.76 MB blob），全量 1.6s；`duplicates` 约 0.1s |
+| 索引规模 | 352 类 / 2280 方法（1961 有方法体）/ 4154 调用边 / 1108 依赖边 / 64 导航边 / 21 通知 |
+| 代码指纹 | 1461 个方法（约 0.76 MB blob），全量 1.6s；`duplicates` 约 0.1s |
 | 重复代码 | 21 组（精确 13 / 近似 8），含 5 个 Category 的 `swizzleMethod:withMethod:` |
 | 关键词验证 | 中文 FTS 命中；头文件/实现/调用方行号与源码一致 |
 | 入口路径 | `path TBFinanceDetailViewController`：AppDelegate --tab@59--> 行情首页 --push@838--> 详情页 |
@@ -693,11 +772,30 @@ eval 失败
 | 协议/block 调用 | `delegate?.captureOutput` → `CameraCaptureViewModelDelegate`；`onSelect` 4 处 block 调用 |
 | 分类归属 | `search_symbol("BreadCrumb")` 命中 `UIViewController` 等 5 个宿主类 |
 | 同名类消歧 | `trace TBTabbarViewController` 返回 2 个声明点，`--module` 切换后方法不串模块 |
-| 向量索引 | 1505 个方法（≥3 行且 ≥80 字符）；全量约 222s，增量约 2~4s |
+| 向量索引 | 1507 个方法（≥3 行且 ≥80 字符）；全量约 222s，增量约 2~4s |
 | `eval` golden 用例 | **31/31 通过**（含 2 条语义用例；无向量时 29 通过 + 2 跳过） |
 | MCP 双客户端验收 | `raw-jsonrpc` 与 `python-sdk` 各 18 个工具；17 个只读工具与查询层逐字段一致 |
 | UI 文案检索 | `find_feature("行情")` 命中 `TBFinanceHomeViewController`；注释里的中文不进类级检索 |
-| 测试 | 98 个 unittest 全部通过（真模型不参与单测，用假 embedder 验链路） |
+| 测试 | 99 个 unittest 全部通过（真模型不参与单测，用假 embedder 验链路） |
+
+### 真实 MCP 会话回放
+
+单测和 golden 只能证明“数据和协议一致”，不能证明“能回答业务问题”。所以用官方
+MCP SDK 真实拉起 `python3 -m ios_qa mcp` 子进程，按开发者口吻连问 7 个问题，
+并做多工具串联（`find_feature` → `trace_class` → `search_methods` → `read_source`）。
+
+| 问题 | 结果 |
+|---|---|
+| 改 `TBRequestManager` 影响谁？ | ✅ 3 层共 8 个类，带证据链 `TBFinanceHTTP... -> TBRequestManager.get` → `TBFinanceService` → `TBFinanceHomeViewController.loadQuotesForCategory:` |
+| 启动后怎么进入行情详情页？ | ✅ `AppDelegate --tab--> TBFinanceHomeViewController`(AppDelegate.swift:59) `--push--> TBFinanceDetailViewController`(.m:838) |
+| 有哪些重复代码？ | ✅ 21 组（精确 13 / 近似 8），能列出 `ImageEditorViewController` 的近似方法簇 |
+| 行情页数据从哪来？ | ⚠️ 结构化链路通，但 `trace_class` 的 `callers` 里混入 `NSCalendar` 等系统类，需要在结果里筛 `own_class` |
+| 相机拍照后怎么保存图片？ | ⚠️ `vector_search` top1 是 `TBSuperResolutionViewController.saveTapped`（按钮点击），真正的 `saveImageToTempDirectory` 排第二 |
+| 行情页面怎么加载数据？ | ⚠️ hybrid 分数 `QWeatherHomeViewController.updateErrorHint` 与 `TBFinanceHomeViewController.loadQuotesForCategory:` 同为 0.500，排序没有业务优先级 |
+| 离屏渲染卡顿怎么监控？ | ❌ 命中相机 Metal 渲染类；代码里没有“离屏渲染”字面量，`TDScreenRenderReport` 需要同义词才能捞到 |
+
+结论：**结构化链路（impact / navigation / duplicates / read_source）可以直接用于问答；
+自然语言检索（vector / find_feature）还需要一轮同义词与重排**，见「已知边界」。
 
 手动抽查建议：
 
@@ -728,6 +826,13 @@ python3 -m ios_qa notifications --unbalanced
   语义近邻需要先 `vectors`，且受 BGE-small-zh 的模型能力限制；
 - 语义检索的 `score` 在 hybrid 模式下是 RRF 融合分（约 0.2~0.9），不是余弦相似度；
   需要余弦时可看 `find_similar_code --mode semantic` 的 dense 分支；
+- **自然语言检索质量**（真实会话实测）：中文 query → ObjC 方法体的排序不稳定，
+  top1 可能是同类里的按钮回调而不是真正做事的方法；同分时没有业务优先级。
+  命中的类/方法名明确时优先用 `find_feature` / `search_methods` / `trace_class`，
+  把 `vector_search` 当召回补充；
+- **同义词覆盖不足**：代码里没有“离屏渲染”“失败重试”这类字面量时，
+  纯关键词会命中相近词的类（相机 Metal 渲染）。需要往 `.ios_qa/synonyms.json`
+  补业务组，后续再加一层基于调用图的轻量重排；
 - 不解析 Objective-C++ 模板细节与宏展开。
 
 ## 后续

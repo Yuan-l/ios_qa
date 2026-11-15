@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# 本仓库不存任何工程的索引与配置；运行产物不应出现在这里
+.ios_qa/
+.data/
+ios_qa.db
+ios_qa.db-shm
+ios_qa.db-wal
+embedding_cache.db
+qdrant_storage/

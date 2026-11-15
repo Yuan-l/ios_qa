@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -69,7 +70,10 @@ DEFAULT_VC_BASES = [
 ]
 
 PROFILE_FILENAME = "project.json"
-DB_RELATIVE_PATH = Path(".data") / "ios_qa.db"
+CONFIG_DIR_NAME = ".ios_qa"
+DB_FILENAME = "ios_qa.db"
+DB_RELATIVE_PATH = Path(CONFIG_DIR_NAME) / DB_FILENAME
+ROOT_ENV_VAR = "IOS_QA_ROOT"
 
 
 @dataclass
@@ -110,13 +114,17 @@ class ProjectProfile:
     ) -> "ProjectProfile":
         """载入 profile。
 
-        优先级：显式 ``profile_path`` > ``root/ios_qa/project.json`` >
-        包内默认 ``project.json``。
+        项目根目录优先级：显式 ``root`` > 环境变量 ``IOS_QA_ROOT`` > 当前目录。
+
+        profile 文件优先级：显式 ``profile_path`` >
+        ``<root>/.ios_qa/project.json`` > ``<root>/ios_qa/project.json``（旧布局）。
         """
         if root is not None:
             root_path = Path(root).expanduser().resolve()
+        elif os.environ.get(ROOT_ENV_VAR):
+            root_path = Path(os.environ[ROOT_ENV_VAR]).expanduser().resolve()
         else:
-            root_path = Path(__file__).resolve().parent.parent
+            root_path = Path.cwd().resolve()
 
         candidate: Path | None = None
         if profile_path:
@@ -124,11 +132,13 @@ class ProjectProfile:
             if not candidate.is_absolute():
                 candidate = root_path / candidate
         else:
-            local = root_path / "ios_qa" / PROFILE_FILENAME
-            if local.exists():
-                candidate = local
-            else:
-                candidate = Path(__file__).resolve().with_name(PROFILE_FILENAME)
+            for local in (
+                root_path / CONFIG_DIR_NAME / PROFILE_FILENAME,
+                root_path / "ios_qa" / PROFILE_FILENAME,
+            ):
+                if local.exists():
+                    candidate = local
+                    break
 
         data: dict = {}
         if candidate and candidate.exists():
@@ -140,7 +150,7 @@ class ProjectProfile:
             if not db_path.is_absolute():
                 db_path = root_path / db_path
         else:
-            db_path = root_path / "ios_qa" / DB_RELATIVE_PATH
+            db_path = root_path / DB_RELATIVE_PATH
 
         return cls(
             name=data.get("name") or root_path.name,
@@ -200,3 +210,8 @@ class ProjectProfile:
     def resolved_db_path(self) -> Path:
         assert self.db_path is not None
         return self.db_path
+
+    @property
+    def config_dir(self) -> Path:
+        """工程专属配置目录：``<root>/.ios_qa``。"""
+        return self.root / CONFIG_DIR_NAME

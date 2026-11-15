@@ -35,7 +35,7 @@ from pathlib import Path
 from . import SCHEMA_VERSION
 from .build import build
 from .config import ProjectProfile
-from .eval import run_eval
+from .eval import resolve_cases_path, run_eval
 from .query import QueryService
 
 
@@ -45,13 +45,16 @@ def _common_parser() -> argparse.ArgumentParser:
     # 写在子命令之前的 ``--root/--db`` 覆盖回 None（argparse 的已知行为）。
     # 真正的默认值在 main() 里统一补齐。
     parser.add_argument(
-        "--root", default=argparse.SUPPRESS, help="项目根目录（默认：包所在工程）"
+        "--root", default=argparse.SUPPRESS,
+        help="项目根目录（默认：环境变量 IOS_QA_ROOT，否则当前目录）",
     )
     parser.add_argument(
-        "--db", default=argparse.SUPPRESS, help="SQLite 路径（默认 ios_qa/.data/ios_qa.db）"
+        "--db", default=argparse.SUPPRESS,
+        help="SQLite 路径（默认 <root>/.ios_qa/ios_qa.db）",
     )
     parser.add_argument(
-        "--profile", default=argparse.SUPPRESS, help="project.json 路径"
+        "--profile", default=argparse.SUPPRESS,
+        help="project.json 路径（默认 <root>/.ios_qa/project.json）",
     )
     parser.add_argument(
         "--json", action="store_true", default=argparse.SUPPRESS, help="输出 JSON"
@@ -118,8 +121,8 @@ def cmd_build(args) -> int:
     check_skipped = False
     if getattr(args, "check", False):
         # 构建后自检：只跑数据层 golden，不调用任何模型。
-        # 只认当前工程的 ios_qa/eval_cases.json；没有就跳过，不阻塞构建。
-        cases_path = profile.root / "ios_qa" / "eval_cases.json"
+        # 只认当前工程的 .ios_qa/eval_cases.json；没有就跳过，不阻塞构建。
+        cases_path = resolve_cases_path(profile)
         if cases_path.exists():
             check = run_eval(profile, report.db_path, cases_path)
         else:
@@ -728,6 +731,12 @@ def cmd_eval(args) -> int:
         return 2
     only = [part.strip() for part in args.only.split(",") if part.strip()] if args.only else None
     report = run_eval(profile, db_path, args.cases, only)
+    if report.get("missing"):
+        print(
+            f"缺少 golden 用例: {report['cases_path']}\n"
+            "在工程内创建 .ios_qa/eval_cases.json（可参考 ios_qa 仓库的 templates/）。"
+        )
+        return 2
     if args.json:
         _dump(report)
         return 0 if report["failed"] == 0 else 1
@@ -961,7 +970,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_mcp)
 
     p = sub.add_parser("eval", parents=[common], help="模型无关的 golden 验收")
-    p.add_argument("--cases", default=None, help="用例 JSON（默认 ios_qa/eval_cases.json）")
+    p.add_argument("--cases", default=None, help="用例 JSON（默认 <root>/.ios_qa/eval_cases.json）")
     p.add_argument("--only", default="", help="只跑指定 id，逗号分隔")
     p.set_defaults(func=cmd_eval)
 

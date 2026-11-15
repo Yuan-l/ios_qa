@@ -271,8 +271,14 @@ final class TBUnrelatedDeskViewController: UIViewController {
             self.assertNotIn("TBUnrelatedDeskViewController", names)
 
 
+_PROFILE_PATH = Path.cwd() / ".ios_qa" / "project.json"
+
+
+@unittest.skipUnless(
+    _PROFILE_PATH.exists(), f"当前目录没有 iOS 工程 profile: {_PROFILE_PATH}"
+)
 class RealRepoSmokeTest(unittest.TestCase):
-    """对当前仓库构建一次，验证解析/行号/查询链路。"""
+    """对当前工程构建一次，验证解析/行号/查询链路（需在工程根目录运行）。"""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -448,7 +454,7 @@ class BuildCheckTest(unittest.TestCase):
         self.root = Path(self._tmp.name)
         (self.root / "App").mkdir()
         (self.root / "App" / "TBWidget.m").write_text(IMPL, encoding="utf-8")
-        self.cases_path = self.root / "ios_qa" / "eval_cases.json"
+        self.cases_path = self.root / ".ios_qa" / "eval_cases.json"
         self.cases_path.parent.mkdir(parents=True)
         (self.cases_path.parent / "project.json").write_text(
             json.dumps({"name": "Demo", "source_dirs": ["."]}), encoding="utf-8"

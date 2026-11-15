@@ -13,10 +13,32 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .config import ProjectProfile
+from .config import CONFIG_DIR_NAME, ProjectProfile
 from .query import QueryService
 
-DEFAULT_CASES = Path(__file__).with_name("eval_cases.json")
+CASES_FILENAME = "eval_cases.json"
+
+
+def resolve_cases_path(
+    profile: ProjectProfile, cases_path: str | Path | None = None
+) -> Path:
+    """定位 golden 用例文件。
+
+    显式 ``cases_path`` > ``<root>/.ios_qa/eval_cases.json`` >
+    ``<root>/ios_qa/eval_cases.json``（旧布局）。
+    """
+    if cases_path:
+        path = Path(cases_path).expanduser()
+        if not path.is_absolute():
+            path = profile.root / path
+        return path
+    for candidate in (
+        profile.root / CONFIG_DIR_NAME / CASES_FILENAME,
+        profile.root / "ios_qa" / CASES_FILENAME,
+    ):
+        if candidate.exists():
+            return candidate
+    return profile.root / CONFIG_DIR_NAME / CASES_FILENAME
 
 
 def _call(service: QueryService, case: dict) -> dict:
@@ -365,7 +387,17 @@ def run_eval(
     cases_path: str | Path | None = None,
     only: list[str] | None = None,
 ) -> dict:
-    path = Path(cases_path) if cases_path else DEFAULT_CASES
+    path = resolve_cases_path(profile, cases_path)
+    if not path.exists():
+        return {
+            "total": 0,
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "missing": True,
+            "cases_path": str(path),
+            "cases": [],
+        }
     config = json.loads(path.read_text(encoding="utf-8"))
     cases = config.get("cases") or []
     if only:

@@ -4,8 +4,12 @@
 
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
+from ios_qa.config import ProjectProfile
 from ios_qa.textnorm import build_search_text, fts_expr, like_pattern, snippet, tokenize
 from ios_qa.synonyms import expand_query, load_groups
 
@@ -83,8 +87,22 @@ class SynonymTest(unittest.TestCase):
         self.assertEqual(len(result), 2)
 
     def test_default_groups_load(self) -> None:
-        groups = load_groups()
-        self.assertTrue(any("行情" in group for group in groups))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / ".ios_qa"
+            config.mkdir()
+            (config / "synonyms.json").write_text(
+                json.dumps({"groups": [["行情", "报价", "quote"]]}),
+                encoding="utf-8",
+            )
+            profile = ProjectProfile.load(root=root)
+            groups = load_groups(profile)
+            self.assertTrue(any("行情" in group for group in groups))
+
+    def test_missing_groups_file_returns_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = ProjectProfile.load(root=Path(tmp))
+            self.assertEqual(load_groups(profile), [])
 
 
 if __name__ == "__main__":

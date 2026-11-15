@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "description": "模型无关的 golden 用例：直接验证查询层返回的类、文件、行号。任何 MCP 客户端都应得到同样的底层结果。",
+  "cases": [
+    {
+      "id": "feature-network",
+      "type": "find_feature",
+      "args": {
+        "query": "网络 请求",
+        "limit": 10
+      },
+      "checks": [
+        {
+          "kind": "class_in_results",
+          "value": "YourNetworkManager"
+        }
+      ],
+      "reason": "中文双词检索能归并到网络门面",
+      "last_reviewed": "2026-01-01"
+    }
+  ]
+}

@@ -14,19 +14,22 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from .config import ProjectProfile
+from .config import CONFIG_DIR_NAME, ProjectProfile
 
-DEFAULT_FILE = Path(__file__).with_name("synonyms.json")
 MAX_EXPANSIONS = 8
 
 
+def _candidate_paths(profile: ProjectProfile | None) -> list[Path]:
+    root = profile.root if profile is not None else Path.cwd()
+    return [
+        root / CONFIG_DIR_NAME / "synonyms.json",
+        root / "ios_qa" / "synonyms.json",
+    ]
+
+
 def load_groups(profile: ProjectProfile | None = None) -> list[list[str]]:
-    """优先读工程自己的 ``ios_qa/synonyms.json``，否则用包内默认。"""
-    candidates: list[Path] = []
-    if profile is not None:
-        candidates.append(profile.root / "ios_qa" / "synonyms.json")
-    candidates.append(DEFAULT_FILE)
-    for path in candidates:
+    """读工程自己的 ``.ios_qa/synonyms.json``（兼容旧布局 ``ios_qa/``）。"""
+    for path in _candidate_paths(profile):
         if not path.exists():
             continue
         try:

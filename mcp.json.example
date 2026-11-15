@@ -3,7 +3,10 @@
     "ios_qa": {
       "command": "python3",
       "args": ["-m", "ios_qa", "mcp"],
-      "cwd": "/absolute/path/to/TrueDepthDemo2"
+      "cwd": "/absolute/path/to/YourApp",
+      "env": {
+        "IOS_QA_ROOT": "/absolute/path/to/YourApp"
+      }
     }
   }
 }

@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ios-qa"
+version = "0.1.0"
+description = "iOS 工程静态代码索引与问答检索：SQLite FTS5 + 可选向量索引，暴露 CLI 与 MCP"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    # 只有 MCP server 需要第三方依赖；构建、查询、eval 全用标准库
+    "mcp>=1.26,<2",
+]
+
+[project.optional-dependencies]
+# 语义检索：本地 Qdrant + BGE/BM42（ONNX，无需 GPU）
+vectors = [
+    "qdrant-client>=1.9",
+    "fastembed>=0.3",
+]
+
+[project.scripts]
+ios-qa = "ios_qa.cli:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["ios_qa*"]
