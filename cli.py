@@ -17,6 +17,8 @@
     python3 -m ios_qa notifications --unbalanced
     python3 -m ios_qa similar QWeatherBaseButton.initWithFrame:
     python3 -m ios_qa duplicates --min-lines 8
+    python3 -m ios_qa vectors
+    python3 -m ios_qa semantic "行情页面怎么加载数据"
     python3 -m ios_qa qa save "问题" "答案"
     python3 -m ios_qa qa search "问题"
     python3 -m ios_qa eval
@@ -87,15 +89,20 @@ def _print_eval_report(report: dict, detailed: bool = True) -> None:
     for item in report["cases"]:
         if not detailed and item["ok"]:
             continue
-        mark = "✅" if item["ok"] else "❌"
+        mark = "⏭" if item.get("skipped") else ("✅" if item["ok"] else "❌")
         reviewed = f"  [复核 {item['last_reviewed']}]" if item["last_reviewed"] else ""
         print(f"{mark} {item['id']}  ({item['type']}){reviewed}")
         if item["reason"]:
             print(f"   {item['reason']}")
+        if item.get("skipped"):
+            print(f"   - 跳过：{item.get('skip_reason', '')}")
         for check in item["checks"]:
             if not check["ok"] or not item["ok"]:
                 print(f"   - {'ok' if check['ok'] else 'FAIL'} {check['kind']}: {check['detail']}")
-    print(f"\n通过 {report['passed']}/{report['total']}，失败 {report['failed']}")
+    summary = f"\n通过 {report['passed']}/{report['total']}，失败 {report['failed']}"
+    if report.get("skipped"):
+        summary += f"，跳过 {report['skipped']}（需要向量索引）"
+    print(summary)
 
 
 def cmd_build(args) -> int:
@@ -492,15 +499,36 @@ def cmd_notifications(args) -> int:
 def cmd_similar(args) -> int:
     with _service(args) as service:
         data = service.find_similar_code(
-            args.target, limit=args.limit, min_similarity=args.min_similarity
+            args.target,
+            limit=args.limit,
+            min_similarity=args.min_similarity,
+            mode=args.mode,
         )
     if args.json:
         _dump(data)
         return 0
     if not data.get("found"):
-        print(f"没有找到「{args.target}」的代码指纹。")
+        print(f"没有找到「{args.target}」的相似方法。")
         if data.get("hint"):
             print(f"  {data['hint']}")
+        return 0
+    if data.get("mode") == "semantic":
+        seed = data.get("resolved") or {}
+        print(f"{seed.get('class_name')}.{seed.get('method_name')}  "
+              f"[语义近邻 / {data.get('model')}]")
+        print(f"  {seed.get('file_path')}:{seed.get('line_start')}")
+        if not data["results"]:
+            print("  没有超过阈值的语义近邻")
+            return 0
+        print()
+        for item in data["results"]:
+            advice = item.get("advice") or {}
+            print(f"  相似 {item['similarity']:.3f}  "
+                  f"{item['class_name']}.{item['method_name']}  ({item['lines']} 行)")
+            print(f"    {item['file_path']}:{item['line_start']}  "
+                  f"{advice.get('label', '')}")
+            for warning in advice.get("warnings") or []:
+                print(f"    ⚠ {warning}")
         return 0
     seed = data["resolved"]
     print(f"{seed['class_name']}.{seed['method_name']}  ({seed['lines']} 行)"
@@ -556,6 +584,100 @@ def cmd_duplicates(args) -> int:
                   f"  ({member['lines']} 行)")
             print(f"     {member['file_path']}:{member['line_start']}")
     return 0
+
+
+def cmd_semantic(args) -> int:
+    with _service(args) as service:
+        data = service.vector_search(
+            args.query, limit=args.limit, module=args.module or ""
+        )
+    if args.json:
+        _dump(data)
+        return 0
+    if not data.get("available"):
+        print(f"语义检索不可用：{data.get('hint', '')}")
+        return 0
+    print(f"语义检索「{data['query']}」  {data.get('fusion')}  "
+          f"索引 {data['summary']['indexed_methods']} 个方法")
+    if not data["results"]:
+        print("  没有命中")
+        return 0
+    for index, item in enumerate(data["results"], 1):
+        print(f"{index}. {item['score']:.3f}  "
+              f"{item['class_name']}.{item['method_name']}  [{item['module']}]")
+        print(f"   {item['file_path']}:{item['line_start']}-{item['line_end']}")
+        if item.get("body_preview"):
+            print(f"   {item['body_preview'][:120]}")
+    return 0
+
+
+def cmd_similar_snippet(args) -> int:
+    path = Path(args.file)
+    if not path.exists():
+        path = Path(args.root or ".") / args.file
+    if not path.exists():
+        print(f"文件不存在: {args.file}")
+        return 1
+    code = path.read_text(encoding="utf-8", errors="replace")
+    with _service(args) as service:
+        data = service.search_similar_snippet(
+            code,
+            limit=args.limit,
+            module=args.module or "",
+            min_similarity=args.min_similarity,
+        )
+    if args.json:
+        _dump(data)
+        return 0
+    if not data.get("available"):
+        print(f"语义检索不可用：{data.get('hint', '')}")
+        return 0
+    print(f"代码片段近邻（≥ {data['min_similarity']:.2f}）  "
+          f"索引 {data['summary']['indexed_methods']} 个方法")
+    if not data["results"]:
+        print("  没有达到阈值的方法")
+        return 0
+    for item in data["results"]:
+        advice = item.get("advice") or {}
+        print(f"  相似 {item['similarity']:.3f}  "
+              f"{item['class_name']}.{item['method_name']}  ({item['lines']} 行)  "
+              f"{advice.get('label', '')}")
+        print(f"    {item['file_path']}:{item['line_start']}")
+    return 0
+
+
+def cmd_vectors(args) -> int:
+    from .vector_build import build_vectors
+
+    profile = _profile(args)
+    try:
+        report = build_vectors(
+            profile,
+            db_path=args.db,
+            full=args.full,
+            verbose=not args.quiet and not args.json,
+            limit=args.limit,
+        )
+    except Exception as exc:  # noqa: BLE001 - 依赖/模型异常统一提示
+        print(f"构建向量索引失败：{exc}")
+        return 1
+    if args.json:
+        _dump(report.to_dict())
+        return 1 if report.errors else 0
+    print(f"向量索引完成：{report.mode}  {report.elapsed_s:.1f}s")
+    print(f"  目录: {report.vector_dir}  collection={report.collection}")
+    print(f"  模型: {report.model} / {report.dim} 维"
+          f"  稀疏: {report.sparse_model}")
+    print(f"  方法: {report.methods_total} 个候选 / {report.methods_selected} 个可向量化")
+    print(f"  写入: points={report.points_written}  "
+          f"dense: embedded={report.embedded} cached={report.cached}  "
+          f"sparse: embedded={report.sparse_embedded} cached={report.sparse_cached}")
+    print(f"  文件: {report.files_changed} 变更 / {report.files_deleted} 删除")
+    print(f"  索引总量: {report.collection_points} 个方法向量")
+    if report.errors:
+        for error in report.errors[:10]:
+            print(f"  - {error}")
+    return 1 if report.errors else 0
 
 
 def cmd_qa(args) -> int:
@@ -690,7 +812,7 @@ def build_parser() -> argparse.ArgumentParser:
     common = _common_parser()
     parser = argparse.ArgumentParser(
         prog="ios_qa",
-        description="iOS 静态代码解析 + 知识库（结构化索引 / 查询 / 重复代码 / MCP）",
+        description="iOS 静态代码解析 + 知识库（结构化索引 / 语义检索 / 重复代码 / MCP）",
         parents=[common],
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -775,9 +897,38 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("similar", parents=[common], help="找结构相近的方法（重复代码）")
     p.add_argument("target", help="Class.method 或方法名")
-    p.add_argument("--min-similarity", dest="min_similarity", type=float, default=0.3)
+    p.add_argument("--min-similarity", dest="min_similarity", type=float, default=None)
     p.add_argument("--limit", type=int, default=10)
+    p.add_argument(
+        "--mode",
+        choices=["lexical", "semantic"],
+        default="lexical",
+        help="lexical=词法指纹（默认）；semantic=Qdrant 语义近邻",
+    )
     p.set_defaults(func=cmd_similar)
+
+    p = sub.add_parser("semantic", parents=[common], help="自然语言语义搜索方法体")
+    p.add_argument("query")
+    p.add_argument("--module", default="")
+    p.add_argument("--limit", type=int, default=5)
+    p.set_defaults(func=cmd_semantic)
+
+    p = sub.add_parser(
+        "similar-snippet", parents=[common], help="任意代码片段找语义相近的方法"
+    )
+    p.add_argument("file", help="代码文件路径")
+    p.add_argument("--module", default="")
+    p.add_argument("--limit", type=int, default=5)
+    p.add_argument(
+        "--min-similarity", dest="min_similarity", type=float, default=0.90
+    )
+    p.set_defaults(func=cmd_similar_snippet)
+
+    p = sub.add_parser("vectors", parents=[common], help="构建 Qdrant 向量索引")
+    p.add_argument("--full", action="store_true", help="重建 collection")
+    p.add_argument("--limit", type=int, default=0, help="只向量化前 N 个方法（调试）")
+    p.add_argument("--quiet", action="store_true")
+    p.set_defaults(func=cmd_vectors)
 
     p = sub.add_parser("duplicates", parents=[common], help="重复代码聚类")
     p.add_argument("--min-lines", dest="min_lines", type=int, default=6)

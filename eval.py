@@ -67,6 +67,25 @@ def _call(service: QueryService, case: dict) -> dict:
             limit=args.get("limit", 20),
             class_name=args.get("class_name", ""),
         )
+    if kind == "vector_search":
+        return service.vector_search(
+            args["query"], limit=args.get("limit", 5), module=args.get("module", "")
+        )
+    if kind == "search_similar_snippet":
+        code = args.get("code", "")
+        if not code and args.get("method_name"):
+            row = service.conn.execute(
+                "SELECT body FROM methods WHERE class_name=? AND method_name=? "
+                "ORDER BY line_start LIMIT 1",
+                (args.get("class_name", ""), args["method_name"]),
+            ).fetchone()
+            code = row["body"] if row else ""
+        return service.search_similar_snippet(
+            code,
+            limit=args.get("limit", 5),
+            module=args.get("module", ""),
+            min_similarity=args.get("min_similarity", 0.90),
+        )
     if kind == "find_notifications":
         return service.find_notifications(
             name=args.get("name", ""),
@@ -144,6 +163,25 @@ def _check(data: dict, spec: dict) -> tuple[bool, str]:
 
     if kind == "trace_found":
         return bool(data.get("found")), f"found={data.get('found')}"
+
+    if kind == "vector_available":
+        return bool(data.get("available")), f"available={data.get('available')} hint={data.get('hint', '')}"
+
+    if kind in {"vector_top", "vector_contains"}:
+        results = data.get("results") or []
+        threshold = float(spec.get("min_score", 0.0))
+        if kind == "vector_top":
+            results = results[:1]
+        seen = [
+            f"{row.get('class_name')}.{row.get('method_name')}={row.get('score')}"
+            for row in results
+        ]
+        ok = any(
+            f"{row.get('class_name')}.{row.get('method_name')}" == spec["value"]
+            and float(row.get("score") or 0) >= threshold
+            for row in results
+        )
+        return ok, f"min_score={threshold} seen={seen}"
 
     if kind == "similar_found":
         return bool(data.get("found")), (
@@ -338,6 +376,22 @@ def run_eval(
     with QueryService(profile, db_path) as service:
         for case in cases:
             checks: list[dict] = []
+            if case.get("requires") == "vectors":
+                available, hint = service._vector_status()
+                if not available:
+                    results.append(
+                        {
+                            "id": case.get("id", ""),
+                            "type": case.get("type", ""),
+                            "reason": case.get("reason") or case.get("note", ""),
+                            "last_reviewed": case.get("last_reviewed", ""),
+                            "ok": True,
+                            "skipped": True,
+                            "skip_reason": hint,
+                            "checks": [{"kind": "skipped", "ok": True, "detail": hint}],
+                        }
+                    )
+                    continue
             try:
                 data = _call(service, case)
                 for spec in case.get("checks") or []:
@@ -359,10 +413,12 @@ def run_eval(
                 }
             )
 
-    passed = sum(1 for item in results if item["ok"])
+    skipped = sum(1 for item in results if item.get("skipped"))
+    passed = sum(1 for item in results if item["ok"] and not item.get("skipped"))
     return {
         "total": len(results),
         "passed": passed,
-        "failed": len(results) - passed,
+        "failed": len(results) - passed - skipped,
+        "skipped": skipped,
         "cases": results,
     }

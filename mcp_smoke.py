@@ -124,6 +124,15 @@ SERVICE_CALLS: dict[str, Callable[[QueryService, dict], Any]] = {
     "find_similar_code": lambda s, a: s.find_similar_code(
         a["target"], limit=a["limit"], min_similarity=a["min_similarity"]
     ),
+    "vector_search": lambda s, a: s.vector_search(
+        a["query"], limit=a["limit"], module=a["module"]
+    ),
+    "search_similar_snippet": lambda s, a: s.search_similar_snippet(
+        a["code"],
+        limit=a["limit"],
+        module=a["module"],
+        min_similarity=a["min_similarity"],
+    ),
     "find_duplicates": lambda s, a: s.find_duplicates(
         min_lines=a["min_lines"],
         min_similarity=a["min_similarity"],
@@ -169,6 +178,17 @@ def build_cases(db_path: str | Path) -> list[dict]:
             "target": seeds["fingerprint_target"] or cls,
             "limit": 5,
             "min_similarity": 0.8,
+        },
+        "vector_search": {
+            "query": f"{cls} 页面 数据加载",
+            "limit": 5,
+            "module": "",
+        },
+        "search_similar_snippet": {
+            "code": "- (void)reload { [self.tableView reloadData]; }",
+            "limit": 5,
+            "module": "",
+            "min_similarity": 0.9,
         },
         "find_duplicates": {
             "min_lines": 6,
@@ -480,7 +500,13 @@ def server_command(profile: ProjectProfile, db_path: str | Path) -> list[str]:
 
 
 def client_env() -> dict[str, str]:
-    env = {"PYTHONPATH": str(PACKAGE_ROOT)}
+    """子进程环境继承父进程：SDK 的 ``StdioServerParameters(env=...)`` 不会自动继承。
+
+    少了 ``HOME``/``HF_ENDPOINT`` 会让 fastembed 找错模型缓存目录，
+    语义工具静默降级成 dense-only，两个客户端结果就不一致了。
+    """
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(PACKAGE_ROOT)
     if "PYTHONPATH" in os.environ:
         env["PYTHONPATH"] = f"{PACKAGE_ROOT}{os.pathsep}{os.environ['PYTHONPATH']}"
     return env

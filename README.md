@@ -6,7 +6,8 @@
 - **中文全文检索**：CJK 单字 + bigram 预分词，不依赖 jieba；支持业务别名扩展
 - **查询 CLI**：功能检索、符号、调用、影响面、页面入口路径、通知配对
 - **重复/相似代码**：词法指纹（改局部变量名也能认出复制粘贴），精确 + 近似重复聚类
-- **MCP server**：16 个工具，可直接接任意支持 stdio 的 MCP 客户端
+- **语义检索**：Qdrant 双通道（BGE-512 稠密 + BM42 稀疏，RRF 融合），自然语言找方法体
+- **MCP server**：18 个工具，可直接接任意支持 stdio 的 MCP 客户端
 
 查询层（`query.py`）不依赖 CLI / MCP，后续接 Agent Loom 只需换接入层。
 
@@ -26,7 +27,7 @@ python3 -m ios_qa build --check
 # 自检
 python3 -m ios_qa doctor
 
-# 模型无关的 golden 验收（29 个用例，不调用任何 LLM）
+# 模型无关的 golden 验收（31 个用例，不调用任何 LLM）
 python3 -m ios_qa eval
 
 # MCP 双客户端验收（协议层 + 数据层，失败退出码 1）
@@ -45,9 +46,15 @@ python3 -m ios_qa path TBFinanceDetailViewController
 python3 -m ios_qa notifications --unbalanced
 python3 -m ios_qa similar QWeatherBaseButton.initWithFrame:
 python3 -m ios_qa duplicates --min-lines 8
+
+# 语义层（可选：需要 qdrant-client + fastembed，首次会下载 BGE/BM42 模型）
+python3 -m ios_qa vectors                     # 增量构建 Qdrant 向量索引
+python3 -m ios_qa semantic "行情页面怎么加载数据"
+python3 -m ios_qa similar TBAlphaView.setupLayout --mode semantic
 ```
 
-索引默认落在 `ios_qa/.data/ios_qa.db`（已加入 `.gitignore`）。
+索引默认落在 `ios_qa/.data/ios_qa.db`（已加入 `.gitignore`）；向量索引与
+embedding 缓存分别落在同目录的 `qdrant_storage/` 和 `embedding_cache.db`。
 
 ### 常用参数
 
@@ -78,8 +85,11 @@ python3 -m ios_qa duplicates --min-lines 8
 | `pages` | 列出 UIViewController 子类 |
 | `path <类>` | 从已知入口到该页面的跳转链；`--depth` / `--limit` / `--no-weak` |
 | `notifications [名称]` | 通知注册/移除配对；`--module` / `--unbalanced` / `--unknown` |
-| `similar <目标>` | 找结构相近的方法；`--min-similarity`（默认 0.3）/ `--limit` |
+| `similar <目标>` | 找相似方法；默认词法指纹（`--min-similarity` 0.3），`--mode semantic` 走 Qdrant |
 | `duplicates` | 重复代码聚类；`--min-lines`（默认 6）/ `--min-similarity`（默认 0.8）/ `--class` |
+| `semantic <查询>` | 自然语言语义检索方法体；`--module` / `--limit`（默认 5） |
+| `similar-snippet <文件>` | 任意代码片段找语义相近的方法；`--min-similarity`（默认 0.90） |
+| `vectors` | 构建 Qdrant 向量索引；`--full` 重建 collection，`--limit` 调试 |
 | `module <名称>` | 模块概览 |
 | `qa save/search/delete` | 历史问答知识库 |
 | `mcp` | 启动 MCP stdio server |
@@ -106,7 +116,7 @@ TBFinanceDetailViewController  导航  (TBFinanceKit)
 
   路径 1  (入口 AppDelegate / 2 跳)
     AppDelegate --tab--> TBFinanceHomeViewController
-      [TrueDepthDemo2/AppDelegate.swift:58]
+      [TrueDepthDemo2/AppDelegate.swift:59]
     TBFinanceHomeViewController --push--> TBFinanceDetailViewController
       [components/TBFinanceKit/TBFinanceKit/Classes/UI/TBFinanceHomeViewController.m:838]
 ```
@@ -155,8 +165,10 @@ MCP 是协议，不绑定客户端：OpenCode、Cursor、Claude Code、自研 Ag
 | `list_pages` | 页面列表 |
 | `find_navigation` | 入口 → 页面的跳转链（含低置信度实例化边） |
 | `find_notifications` | 通知注册/移除查询，`unbalanced_only` 只看未配对 |
-| `find_similar_code` | 结构相近的方法（改过变量名也能认出来），`min_similarity` 默认 0.3 |
+| `find_similar_code` | 相似方法；`mode=lexical`（默认，词法指纹）/ `mode=semantic`（Qdrant 近邻） |
 | `find_duplicates` | 重复代码聚类，`min_lines` / `min_similarity` / `class_name` |
+| `vector_search` | 自然语言语义搜索方法体（dense + BM42，RRF 融合），可传 `module` |
+| `search_similar_snippet` | 任意代码片段找语义相近的方法，返回 `source_code` 与复用建议 |
 | `list_module` | 模块概览 |
 | `search_qa` | 检索历史问答 |
 | `save_qa` | 保存问答 |
@@ -182,7 +194,7 @@ MCP 是协议，不绑定客户端：OpenCode、Cursor、Claude Code、自研 Ag
 schema，不在真实索引里造数据。
 
 ```bash
-python3 -m ios_qa mcp-smoke                 # 两个客户端 + 15 个只读工具
+python3 -m ios_qa mcp-smoke                 # 两个客户端 + 17 个只读工具
 python3 -m ios_qa mcp-smoke --client raw    # 只跑 stdlib 客户端
 python3 -m ios_qa mcp-smoke --only trace_class
 python3 -m ios_qa mcp-smoke --json          # CI 消费
@@ -194,9 +206,9 @@ python3 -m ios_qa mcp-smoke --json          # CI 消费
 MCP 验收：TrueDepthDemo2  (ios_qa/.data/ios_qa.db)
 
 协议层
-  ✅ raw-jsonrpc  16 个工具  服务端 ios_qa / 协议 2024-11-05
-  ✅ python-sdk  16 个工具  服务端 ios_qa / 协议 2025-11-25
-  工具集合一致: 是（16 个）
+  ✅ raw-jsonrpc  18 个工具  服务端 ios_qa / 协议 2024-11-05
+  ✅ python-sdk  18 个工具  服务端 ios_qa / 协议 2025-11-25
+  工具集合一致: 是（18 个）
 
 数据层（客户端返回 vs QueryService 直接调用）
   ✅ kb_info              与查询层逐字段一致
@@ -206,7 +218,7 @@ MCP 验收：TrueDepthDemo2  (ios_qa/.data/ios_qa.db)
   ...
   ⏭  save_qa              写路径只验协议
 
-通过 15/15 个工具（失败 0）；协议层通过
+通过 17/17 个工具（失败 0）；协议层通过
 ```
 
 验收参数不写死类名：`build_cases()` 从索引里取样（方法最多的类、页面、模块、
@@ -230,6 +242,9 @@ ios_qa/
 │   ├── swift.py       class/struct/enum/protocol/extension/actor
 │   └── ui.py          storyboard/xib：入口与 segue
 ├── fingerprint.py     代码指纹：token 归一化、MinHash、LSH 分带、Jaccard
+├── embedding.py       BGE-512 / BM42 provider + embedding_cache.db 缓存
+├── vector_store.py    Qdrant 本地模式：collection methods、dense/sparse/RRF
+├── vector_build.py    向量索引构建：筛选、point_id、增量 file_hashes
 ├── db.py              DDL、增量写入、classes 聚合、指纹重建、FTS 重建
 ├── build.py           构建编排、git 元数据、build_runs
 ├── query.py           查询服务（纯 Python API）
@@ -250,6 +265,11 @@ ios_qa/
 
 FTS5 虚表：
 `classes_fts`、`methods_fts`、`qa_fts`（全量重建，数据量级下成本可接受）
+
+语义索引（同级 `.data/` 下，均 gitignored）：
+`qdrant_storage/`（collection `methods`，dense 512 维 + sparse BM42）、
+`embedding_cache.db`（`cache` 稠密 / `sparse_cache` 稀疏）、
+`qdrant_storage/build_meta.json`、`qdrant_storage/file_hashes.json`
 
 ### 中文检索
 
@@ -401,11 +421,92 @@ $ python3 -m ios_qa duplicates --min-lines 10 --limit 1
 - 一组重复用并查集聚成连通分量，`kind=exact` 要求全组哈希相同，
   否则 `near` 且 `similarity` 取组内最低的复核值；跨模块的组会标
   `cross_module=true`；
-- 实测本仓库：1452 个指纹 / 约 0.75 MB blob，全量计算约 1.6s；
+- 实测本仓库：1459 个指纹 / 约 0.76 MB blob，全量计算约 1.6s；
   `duplicates` 查询约 0.1s。
 
 已知边界：改名、改注释、换字面量都还能命中；**换一种实现思路**（结构不同）
-不会命中，这是词法指纹的固有边界，语义相似留给 P3-b 的向量层。
+不会命中，这是词法指纹的固有边界。语义相近（不要求结构一致）由 P3-b 的
+向量层负责。
+
+### 语义检索（P3-b：Qdrant + BGE / BM42）
+
+两套索引用途不同：
+
+| 问法 | 走哪层 | 原因 |
+|---|---|---|
+| 「TBRequestManager 在哪」 | SQLite FTS5 | 类名/方法名是精确词，FTS 更快更准 |
+| 「行情页面怎么加载数据」 | Qdrant 向量 | 提问里没有符号名，需要语义相似 |
+| 「这个改动会影响谁」 | SQLite 调用边 | 图结构查询，向量帮不上忙 |
+
+与参考文档（`extracted/Ios-qa MCP Server完整技术分析.md`、
+`iOS向量库 && 飞书loom.md`）逐条对齐：
+
+| 文档要求 | 本实现 |
+|---|---|
+| 稠密模型 `BAAI/bge-small-zh-v1.5`，512 维 | 一致，`fastembed` + ONNX Runtime |
+| 稀疏 BM42（`Qdrant/bm42-all-minilm-l6-v2-attentions`） | 一致，与稠密向量同写一个 collection |
+| collection `methods`，dense 余弦 | 一致 |
+| Hybrid = dense + sparse，Qdrant 原生 RRF（k=60） | 一致，`Prefetch` + `Fusion.RRF` |
+| 索引文本 `search_document: 类:{class} 方法:{method}\n{body[:2000]}` | 一致 |
+| 查询文本 `search_query: {query}`；片段 `search_document: {code}` | 一致 |
+| `point_id = MD5(file_path:method_name)[:16]` | 一致，upsert 天然幂等 |
+| payload：class/method/module/language/file/line/body_preview | 一致 |
+| 跳过 <3 行或 <80 字符的方法 | 一致 |
+| `embedding_cache.db`：key=`MD5("{model}:{text}")`，float32 BLOB | 一致，稠密 `cache` + 稀疏 `sparse_cache` |
+| `build_meta.json` / `file_hashes.json` 增量 | 一致 |
+| `vector_search` / `find_similar_code` / `search_similar_snippet` / `scan_duplicates` | 前三个已实现；`scan_duplicates` 的能力由 P3-a `find_duplicates` 覆盖（词法指纹，可复现） |
+| Qdrant server | 用 `QdrantClient(path=...)` 本地持久化，API 语义一致；换 server 只改构造参数 |
+
+文档内部有一处冲突：总览写 `jina-embeddings-v2-base-code`（768 维），
+MCP 技术分析写 BGE-512。这里取更具体的 BGE-512；维度在 `build_meta.json`
+里，换模型会触发全量重建。
+
+安装依赖（首次运行会下载约 100 MB 模型）：
+
+```bash
+python3 -m pip install qdrant-client fastembed
+
+# huggingface.co 直连证书失败时走镜像
+export HF_ENDPOINT=https://hf-mirror.com
+python3 -m ios_qa vectors
+```
+
+构建与查询：
+
+```bash
+python3 -m ios_qa vectors              # 增量：按 file_hashes.json 只重算变更文件
+python3 -m ios_qa vectors --full       # 重建 collection
+
+python3 -m ios_qa semantic "相机拍照后怎么保存图片"
+python3 -m ios_qa similar MainCameraEditViewController.saveImageToTempDirectory --mode semantic
+python3 -m ios_qa similar-snippet SomeSnippet.m --min-similarity 0.9
+```
+
+```text
+$ python3 -m ios_qa semantic "相机拍照后怎么保存图片"
+语义检索「相机拍照后怎么保存图片」  rrf  索引 1505 个方法
+1. 0.833  TBSuperResolutionViewController.saveTapped  [MyCameraModule]
+   components/MyCameraModule/ViewController/TBSuperResolutionViewController.swift:...
+2. 0.625  MainCameraEditViewController.saveImageToTempDirectory  [MyCameraModule]
+   ...
+```
+
+实现要点：
+
+- `query.py` 只依赖 `embedding.py` / `vector_store.py` 的接口，模型可换；
+  没装依赖或没建索引时返回 `available=false` + `hint`，不抛异常；
+- `find_similar_code` 保留 `mode=lexical`（默认，golden 依赖），语义模式用源方法
+  的稠密向量取近邻，并附参考文档的复用建议阈值（≥0.95 高度重复 / ≥0.90
+  结构相近 / 其余部分相似）+ 短方法、骨架方法警告；
+- `search_similar_snippet` 把任意代码当文档向量化，返回时从源码读取
+  `source_code`，默认只保留 score ≥ 0.90；
+- Qdrant 本地模式有目录锁：同一个 `qdrant_storage` 不能并发开两个 client，
+  `QueryService.close()` 会按顺序关闭 store / 缓存 / SQLite。
+
+实测本仓库：1959 个有方法体的方法 → 1505 个可向量化；`vectors --full`
+222.5s（首次含模型加载），增量 2~4s（0~41 个 point）；语义查询约 0.3~1s。
+已知限制：BGE-small-zh 是通用中文小模型，中文 query → ObjC 方法体的召回
+不总是精确，类名/方法名明确时仍应优先用 `find_feature` / `search_methods`。
 
 ---
 
@@ -468,13 +569,15 @@ python3 -m unittest discover -s ios_qa/tests -v
 - 同名类消歧：声明点识别、`trace --module` 收敛、未知模块回退
 - UI 文案：字面量提取（跳过注释/纯英文/超长）、类级检索命中
 - 多行类声明、头文件变更触发同目录实现重解析
-- MCP 工具集合与调用返回（14 个工具）
+- 代码指纹：token 归一化（含 ObjC `@"..."`）、短方法过滤、精确/近似重复聚类
+- 向量层：文本前缀、缓存读写、Qdrant 构建/增量/删除、dense/sparse/RRF 查询
+- MCP 工具集合与调用返回（18 个工具）
 - 双客户端验收：stdlib JSON-RPC 客户端、官方 SDK 客户端、`save_qa` 写路径往返、
   `mcp-smoke` 退出码
 - `build --check`：通过 / 失败退出码 3 / 无用例跳过 / 不加参数不跑 eval
 - 真实仓库 smoke：规模、`TBRequestManager.h:29`、`TBFinanceHTTP.m:74`、
   入口链存在性（具体行号由 golden 负责，源码每次改动都会挪行）
-- `run_eval()`：27 个 golden 用例全绿，且每条都带 `last_reviewed`
+- `run_eval()`：31 个 golden 用例全绿，且每条都带 `last_reviewed`
 
 ---
 
@@ -540,6 +643,8 @@ python3 -m ios_qa build --check
 | `similar_found` | `similar` 找到了目标方法的指纹 |
 | `similar_top` / `similar_contains` | 相似结果首条 / 任意一条是 `value`，且 `similarity` ≥ `min_similarity` |
 | `duplicate_group` | 某一重复组覆盖 `members` 全部类.方法，且 `similarity` ≥ `min_similarity` |
+| `vector_available` | 语义索引可用（未构建时整条用例按 `requires` 跳过） |
+| `vector_top` / `vector_contains` | 首条 / 任意一条结果是 `value`，且 `score` ≥ `min_score` |
 
 ### 维护策略
 
@@ -575,23 +680,24 @@ eval 失败
 
 | 项目 | 结果 |
 |---|---|
-| 全量构建耗时 | 约 5s（364 文件 / 5.1 万行，含代码指纹） |
+| 全量构建耗时 | 约 6s（364 文件 / 5.1 万行，含代码指纹） |
 | 重复构建 | `files_parsed=0`，计数不变 |
 | 解析失败 | 0 |
-| 索引规模 | 352 类 / 2271 方法 / 4138 调用边 / 1105 依赖边 / 64 导航边 / 21 通知 |
-| 代码指纹 | 1452 个方法（约 0.75 MB blob），全量 1.6s；`duplicates` 约 0.1s |
+| 索引规模 | 352 类 / 2278 方法（1959 有方法体）/ 4153 调用边 / 1107 依赖边 / 64 导航边 / 21 通知 |
+| 代码指纹 | 1459 个方法（约 0.76 MB blob），全量 1.6s；`duplicates` 约 0.1s |
 | 重复代码 | 21 组（精确 13 / 近似 8），含 5 个 Category 的 `swizzleMethod:withMethod:` |
 | 关键词验证 | 中文 FTS 命中；头文件/实现/调用方行号与源码一致 |
-| 入口路径 | `path TBFinanceDetailViewController`：AppDelegate --tab@58--> 行情首页 --push@838--> 详情页 |
+| 入口路径 | `path TBFinanceDetailViewController`：AppDelegate --tab@59--> 行情首页 --push@838--> 详情页 |
 | 通知配对 | 未配对 1 条：`CameraViewController.tbLanguageDidChange`（只注册不移除） |
 | 业务别名 | `报价` 经同义词命中行情页 `TBFinanceHomeViewController`（靠界面文案 `@"行情"`）；`jank` → 卡顿 → `TDLongTaskMonitor` |
 | 协议/block 调用 | `delegate?.captureOutput` → `CameraCaptureViewModelDelegate`；`onSelect` 4 处 block 调用 |
 | 分类归属 | `search_symbol("BreadCrumb")` 命中 `UIViewController` 等 5 个宿主类 |
 | 同名类消歧 | `trace TBTabbarViewController` 返回 2 个声明点，`--module` 切换后方法不串模块 |
-| `eval` golden 用例 | **29/29 通过**（不依赖任何模型） |
-| MCP 双客户端验收 | `raw-jsonrpc` 与 `python-sdk` 各 16 个工具；15 个只读工具与查询层逐字段一致 |
+| 向量索引 | 1505 个方法（≥3 行且 ≥80 字符）；全量约 222s，增量约 2~4s |
+| `eval` golden 用例 | **31/31 通过**（含 2 条语义用例；无向量时 29 通过 + 2 跳过） |
+| MCP 双客户端验收 | `raw-jsonrpc` 与 `python-sdk` 各 18 个工具；17 个只读工具与查询层逐字段一致 |
 | UI 文案检索 | `find_feature("行情")` 命中 `TBFinanceHomeViewController`；注释里的中文不进类级检索 |
-| 测试 | 87 个 unittest 全部通过 |
+| 测试 | 98 个 unittest 全部通过（真模型不参与单测，用假 embedder 验链路） |
 
 手动抽查建议：
 
@@ -618,8 +724,10 @@ python3 -m ios_qa notifications --unbalanced
   属性仍是启发式，`confidence=low`；
 - 同名类在 `classes` 里仍是一行（`method_count` 是合并值），
   `trace --module` 只收敛查询结果，不改写聚合表；
-- 重复/相似代码用**词法指纹**判定结构一致，不做语义等价（改名能命中，换实现思路不命中）；
-- 向量语义检索留到 P3-b，可不依赖模型默认关闭；
+- 重复/相似代码默认用**词法指纹**判定结构一致（改名能命中，换实现思路不命中）；
+  语义近邻需要先 `vectors`，且受 BGE-small-zh 的模型能力限制；
+- 语义检索的 `score` 在 hybrid 模式下是 RRF 融合分（约 0.2~0.9），不是余弦相似度；
+  需要余弦时可看 `find_similar_code --mode semantic` 的 dense 分支；
 - 不解析 Objective-C++ 模板细节与宏展开。
 
 ## 后续
@@ -645,5 +753,8 @@ python3 -m ios_qa notifications --unbalanced
 - **P3-a（已完成）**：相似代码 / 重复扫描 —— `code_fingerprints` 表、MinHash + LSH
   出候选、shingle 集合精确复核；`similar` / `duplicates` / `find_similar_code` /
   `find_duplicates`；golden 扩到 29 条；
-- **P3-b**：向量语义检索（SQLite BLOB + Python 余弦，可插拔 embed provider，
-  默认关闭）+ Agent Loom 接入。
+- **P3-b（已完成）**：向量语义检索 —— Qdrant `methods` collection（BGE-512 +
+  BM42，RRF k=60）、`embedding_cache.db`、`file_hashes.json` 增量；
+  `vectors` / `semantic` / `similar-snippet`、`vector_search` /
+  `search_similar_snippet`、`find_similar_code(mode=semantic)`；golden 扩到 31 条；
+- **下一步**：Agent Loom 接入（MCP 已是稳定协议层，不绑定模型）。

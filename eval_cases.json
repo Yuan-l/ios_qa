@@ -270,7 +270,7 @@
           "kind": "navigation_edge",
           "from": "AppDelegate",
           "to": "TBFinanceHomeViewController",
-          "line": 58,
+          "line": 59,
           "edge_kind": "tab"
         },
         {
@@ -298,7 +298,7 @@
           "kind": "navigation_edge",
           "from": "AppDelegate",
           "to": "TBTabbarViewController",
-          "line": 69,
+          "line": 70,
           "edge_kind": "root"
         },
         {
@@ -407,7 +407,7 @@
           "from": "AppDelegate",
           "to": "TBInfrastructureDemoViewController",
           "edge_kind": "tab",
-          "line": 66
+          "line": 67
         }
       ],
       "reason": "多行类声明 + #if DEBUG 里的 tab 页面也要进索引，否则入口链断",
@@ -586,6 +586,49 @@
         }
       ],
       "reason": "5 个 Category 的 swizzleMethod:withMethod: 逐字相同，必须被聚成同一组精确重复",
+      "last_reviewed": "2026-11-15"
+    },
+    {
+      "id": "vector-camera-save",
+      "type": "vector_search",
+      "requires": "vectors",
+      "args": {
+        "query": "相机拍照后怎么保存图片",
+        "limit": 5
+      },
+      "checks": [
+        {
+          "kind": "vector_available"
+        },
+        {
+          "kind": "vector_contains",
+          "value": "MainCameraEditViewController.saveImageToTempDirectory"
+        }
+      ],
+      "reason": "自然语言语义检索要能命中相机保存图片的方法（dense+BM42 RRF）",
+      "last_reviewed": "2026-11-15"
+    },
+    {
+      "id": "snippet-camera-save",
+      "type": "search_similar_snippet",
+      "requires": "vectors",
+      "args": {
+        "class_name": "MainCameraEditViewController",
+        "method_name": "saveImageToTempDirectory",
+        "limit": 5,
+        "min_similarity": 0.9
+      },
+      "checks": [
+        {
+          "kind": "vector_available"
+        },
+        {
+          "kind": "vector_top",
+          "value": "MainCameraEditViewController.saveImageToTempDirectory",
+          "min_score": 0.95
+        }
+      ],
+      "reason": "代码片段检索：把已索引方法的 body 当查询，第一名应是它自己",
       "last_reviewed": "2026-11-15"
     }
   ]

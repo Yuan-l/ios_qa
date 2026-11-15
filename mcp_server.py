@@ -25,6 +25,8 @@ iOS 工程静态知识库。回答代码问题前优先用这里的工具定位�
 - 查类结构/调用链/通知/API：trace_class
 - 查方法：search_methods；查谁调用：find_callers；评估改动影响：impact_analysis
 - 找复制粘贴：find_similar_code（单方法）/ find_duplicates（全仓库聚类）
+- 语义搜索：vector_search（自然语言）/ search_similar_snippet（代码片段）；
+  find_similar_code(mode="semantic") 用向量找语义近邻
 - 需要精确行号时用 read_source 读原文件
 所有结果都带 file_path 与行号。
 """
@@ -149,17 +151,57 @@ def find_notifications(
 
 @mcp.tool()
 def find_similar_code(
-    target: str, limit: int = 10, min_similarity: float = 0.3
+    target: str = "",
+    limit: int = 10,
+    min_similarity: float | None = None,
+    mode: str = "lexical",
+    class_name: str = "",
+    method_name: str = "",
+    module: str = "",
 ) -> str:
-    """找结构相近的方法：改过变量名/注释的复制粘贴也能认出来。
+    """找相近的方法。
 
-    ``target`` 用 ``Class.method`` 或方法名。相似度按归一化 token 的
-    shingle 集合算精确 Jaccard，不是估计值。
+    - ``mode=lexical``（默认）：词法指纹，改过变量名/注释的复制粘贴也能认出来；
+      similarity 是归一化 token 的 shingle 集合 Jaccard。
+    - ``mode=semantic``：Qdrant 语义近邻（BGE-512 + BM42），返回余弦
+      similarity 与复用建议；可传 ``class_name`` + ``method_name`` 或
+      ``target="Class.method"``。
     """
     with _service() as service:
         return _dump(
             service.find_similar_code(
-                target, limit=limit, min_similarity=min_similarity
+                target,
+                limit=limit,
+                min_similarity=min_similarity,
+                mode=mode,
+                class_name=class_name,
+                method_name=method_name,
+                module=module,
+            )
+        )
+
+
+@mcp.tool()
+def vector_search(query: str, limit: int = 5, module: str = "") -> str:
+    """自然语言语义搜索方法体（dense + BM42 sparse，Qdrant RRF 融合）。"""
+    with _service() as service:
+        return _dump(
+            service.vector_search(query, limit=limit, module=module)
+        )
+
+
+@mcp.tool()
+def search_similar_snippet(
+    code: str, limit: int = 5, module: str = "", min_similarity: float = 0.90
+) -> str:
+    """任意代码片段找项目里语义相近的方法（返回 source_code 与复用建议）。"""
+    with _service() as service:
+        return _dump(
+            service.search_similar_snippet(
+                code,
+                limit=limit,
+                module=module,
+                min_similarity=min_similarity,
             )
         )
 

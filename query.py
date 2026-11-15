@@ -16,9 +16,19 @@ from typing import Any, Iterable
 
 from .config import ProjectProfile
 from .db import connect, counts, get_metadata
+from .embedding import (
+    EMBED_MODEL,
+    DenseEmbedder,
+    EmbeddingCache,
+    EmbeddingUnavailable,
+    SparseEmbedder,
+    query_text,
+    snippet_text,
+)
 from .fingerprint import band_keys, decode_shingles, jaccard
 from .synonyms import expand_query, load_groups
 from .textnorm import build_search_text, fts_expr, like_pattern, snippet
+from .vector_build import read_meta, vector_dir
 
 
 def _json_list(raw: str | None) -> list:
@@ -61,6 +71,31 @@ def _class_row(row: sqlite3.Row, detail: bool = False) -> dict:
     return data
 
 
+_TRACE_LINE_RE = re.compile(
+    r"(?i)\b(?:trace_?start|trace_?end)\b|TBBusinessMonitor"
+)
+
+
+def code_advice(score: float, lines: int, body: str) -> dict:
+    """参考方案的复用建议阈值 + 短方法/骨架方法警告。"""
+    if score >= 0.95:
+        label = "⚠️ 高度重复"
+    elif score >= 0.90:
+        label = "🔍 结构相近（请人工确认）"
+    else:
+        label = "💡 部分相似"
+    warnings: list[str] = []
+    if lines <= 5:
+        warnings.append("短方法（≤5 行），相似度可能来自样板代码")
+    remainder = "\n".join(
+        line for line in (body or "").splitlines() if not _TRACE_LINE_RE.search(line)
+    )
+    remainder = re.sub(r"[\s{};()\[\].,:+-]", "", remainder)
+    if (body or "").strip() and not remainder:
+        warnings.append("骨架方法（只含 TraceStart/TraceEnd），相似不代表重复")
+    return {"label": label, "warnings": warnings}
+
+
 def _shingle_ids(row: sqlite3.Row) -> set[int]:
     """指纹行 -> shingle 集合（重复代码复核用）。"""
     return decode_shingles(row["shingles"])
@@ -94,8 +129,16 @@ class QueryService:
         self.conn = connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
         self.synonym_groups = load_groups(profile)
+        self._vector_store = None
+        self._embedding_cache = None
 
     def close(self) -> None:
+        if self._vector_store is not None:
+            self._vector_store.close()
+            self._vector_store = None
+        if self._embedding_cache is not None:
+            self._embedding_cache.close()
+            self._embedding_cache = None
         self.conn.close()
 
     def __enter__(self) -> "QueryService":
@@ -149,6 +192,40 @@ class QueryService:
             "SELECT * FROM build_runs ORDER BY id DESC LIMIT 1"
         ).fetchone()
 
+        # 语义索引状态（参考方案的 build_meta.json / kb_info）
+        vector_meta = read_meta(self.profile, self.db_path)
+        eligible_methods = self.conn.execute(
+            "SELECT COUNT(*) FROM methods WHERE has_body=1 "
+            "AND LENGTH(TRIM(body)) >= 80 "
+            "AND (line_end - line_start + 1) >= 3"
+        ).fetchone()[0]
+        vector_info = {
+            "available": bool(vector_meta.get("method_count")),
+            "model": vector_meta.get("model", ""),
+            "sparse_model": vector_meta.get("sparse_model", ""),
+            "dim": vector_meta.get("dim", 0),
+            "method_count": vector_meta.get("method_count", 0),
+            "build_time": vector_meta.get("build_time", ""),
+        }
+        if vector_meta:
+            built = vector_meta.get("build_time", "")
+            if built:
+                try:
+                    vector_age = (dt.datetime.now() - dt.datetime.fromisoformat(built)).days
+                    vector_info["index_age_days"] = vector_age
+                    if vector_age > 7:
+                        warnings.append(
+                            f"向量索引已 {vector_age} 天未更新，建议运行 vectors"
+                        )
+                except ValueError:
+                    pass
+            indexed = int(vector_meta.get("method_count") or 0)
+            if abs(indexed - eligible_methods) > max(20, eligible_methods // 10):
+                warnings.append(
+                    f"向量索引 {indexed} 个方法，当前可向量化方法 {eligible_methods} 个，"
+                    "建议运行 vectors 增量更新"
+                )
+
         return {
             "project": metadata.get("project_name", self.profile.name),
             "project_root": metadata.get("project_root", str(self.profile.root)),
@@ -164,6 +241,7 @@ class QueryService:
             "source_loc": metadata.get("source_loc", ""),
             "counts": table_counts,
             "methods_with_body": body_methods,
+            "vectors": vector_info,
             "unbalanced_notifications": unbalanced,
             "last_build": dict(last_run) if last_run else None,
             "warnings": warnings,
@@ -1126,11 +1204,48 @@ class QueryService:
         return self.conn.execute(sql, params).fetchall()
 
     def find_similar_code(
-        self, target: str, limit: int = 10, min_similarity: float = 0.3
+        self,
+        target: str = "",
+        limit: int = 10,
+        min_similarity: float | None = None,
+        mode: str = "lexical",
+        class_name: str = "",
+        method_name: str = "",
+        module: str = "",
     ) -> dict:
-        """找和 target 方法结构相近的方法（改过变量名也能认出来）。"""
+        """找和 target 方法相近的方法。
+
+        ``mode=lexical``（默认）：词法指纹，精确/近似的复制粘贴；
+        ``mode=semantic``：Qdrant 语义近邻，返回余弦分数与复用建议
+        （参考方案的 ``find_similar_code``）。
+        """
         target = (target or "").strip()
+        if not target and class_name:
+            target = f"{class_name}.{method_name}" if method_name else class_name
         limit = max(1, min(int(limit), 100))
+        mode = (mode or "lexical").strip().lower()
+        if mode not in {"lexical", "semantic"}:
+            return {
+                "target": target, "found": False, "results": [], "matches": [],
+                "hint": "mode 只支持 lexical / semantic",
+            }
+        if class_name or method_name:
+            class_name = class_name.strip()
+            method_name = method_name.strip()
+        else:
+            class_name, method_name = (
+                target.split(".", 1) if "." in target else ("", target)
+            )
+        if mode == "semantic":
+            return self._semantic_similar(
+                class_name,
+                method_name,
+                limit=limit,
+                min_similarity=0.0 if min_similarity is None else float(min_similarity),
+                module=module,
+            )
+        if min_similarity is None:
+            min_similarity = 0.3
         min_similarity = max(0.05, min(float(min_similarity), 1.0))
         empty = {"target": target, "found": False, "results": [], "matches": []}
         if not target:
@@ -1335,6 +1450,226 @@ class QueryService:
                 "pairs": len(verified),
             },
             "clusters": out[:limit],
+        }
+
+    # ------------------------------------------------------------------
+    # 语义检索（Qdrant + BGE/BM42，对应参考方案的 Qdrant 向量层）
+    # ------------------------------------------------------------------
+    def _vectors(self):
+        if self._vector_store is None:
+            from .vector_store import VectorStore
+
+            self._vector_store = VectorStore(vector_dir(self.profile, self.db_path))
+        return self._vector_store
+
+    def _cache(self) -> EmbeddingCache:
+        if self._embedding_cache is None:
+            self._embedding_cache = EmbeddingCache(
+                Path(self.db_path).parent / "embedding_cache.db"
+            )
+        return self._embedding_cache
+
+    def _vector_status(self) -> tuple[bool, str]:
+        meta = read_meta(self.profile, self.db_path)
+        if not meta.get("method_count"):
+            return False, "向量索引未构建：先运行 python3 -m ios_qa vectors"
+        try:
+            if not self._vectors().collection_exists():
+                return False, "向量索引缺失 collection：重新运行 vectors"
+        except Exception as exc:  # noqa: BLE001 - 依赖/存储异常都转成提示
+            return False, f"向量库不可用：{exc}"
+        return True, ""
+
+    def _method_body(self, file_path: str, line_start: int, method_name: str) -> str:
+        row = self.conn.execute(
+            "SELECT body FROM methods WHERE file_path=? AND line_start=? AND method_name=?",
+            (file_path, line_start, method_name),
+        ).fetchone()
+        return row["body"] if row else ""
+
+    def _read_source_range(self, file_path: str, start: int, end: int) -> str:
+        path, _ = self._resolve_path(file_path)
+        if path is None or start <= 0:
+            return ""
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return ""
+        end = min(end or start, len(lines))
+        return "\n".join(lines[start - 1 : end])
+
+    def vector_search(
+        self, query: str, limit: int = 5, module: str = "", min_score: float = 0.0
+    ) -> dict:
+        """自然语言语义搜索方法体（dense + BM42 sparse，Qdrant RRF 融合）。"""
+        query = (query or "").strip()
+        limit = max(1, min(int(limit), 50))
+        base = {
+            "query": query,
+            "module": module,
+            "model": EMBED_MODEL,
+            "results": [],
+        }
+        if not query:
+            return {**base, "available": False, "hint": "query 不能为空"}
+        available, hint = self._vector_status()
+        if not available:
+            return {**base, "available": False, "hint": hint}
+        store = self._vectors()
+        try:
+            cache = self._cache()
+            dense = DenseEmbedder(cache).embed_query(query_text(query))
+            fusion = "dense"
+            if store.sparse:
+                try:
+                    sparse = SparseEmbedder(cache).embed_query(query_text(query))
+                    hits = store.search_hybrid(dense, sparse, limit, module)
+                    fusion = "rrf"
+                except EmbeddingUnavailable:
+                    hits = store.search_dense(dense, limit, module)
+            else:
+                hits = store.search_dense(dense, limit, module)
+        except EmbeddingUnavailable as exc:
+            return {**base, "available": False, "hint": str(exc)}
+        hits = [hit for hit in hits if hit["score"] >= min_score]
+        return {
+            **base,
+            "available": True,
+            "fusion": fusion,
+            "count": len(hits),
+            "results": hits,
+            "summary": {"indexed_methods": store.count()},
+        }
+
+    def _semantic_similar(
+        self,
+        class_name: str,
+        method_name: str,
+        limit: int,
+        min_similarity: float,
+        module: str = "",
+    ) -> dict:
+        target = f"{class_name}.{method_name}" if class_name else method_name
+        empty = {
+            "mode": "semantic",
+            "target": target,
+            "found": False,
+            "results": [],
+        }
+        if not class_name or not method_name:
+            return {
+                **empty,
+                "hint": "semantic 模式需要 Class.method，或同时给 class_name + method_name",
+            }
+        available, hint = self._vector_status()
+        if not available:
+            return {**empty, "hint": hint}
+        store = self._vectors()
+        source = store.find_method(class_name, method_name)
+        if source is None:
+            return {
+                **empty,
+                "hint": "向量索引里没有这个方法：可能方法太短，或 vectors 尚未更新",
+            }
+        hits = store.search_dense(source["dense"], limit + 1, module)
+        results = []
+        for hit in hits:
+            if hit["class_name"] == class_name and hit["method_name"] == method_name:
+                continue
+            score = float(hit["score"])
+            if score < min_similarity:
+                continue
+            lines = max(1, hit["line_end"] - hit["line_start"] + 1)
+            body = self._method_body(
+                hit["file_path"], hit["line_start"], hit["method_name"]
+            )
+            results.append(
+                {
+                    **hit,
+                    "similarity": round(score, 4),
+                    "lines": lines,
+                    "advice": code_advice(score, lines, body),
+                }
+            )
+            if len(results) >= limit:
+                break
+        payload = source["payload"]
+        return {
+            "mode": "semantic",
+            "target": target,
+            "found": True,
+            "available": True,
+            "model": EMBED_MODEL,
+            "resolved": {
+                "class_name": payload.get("class_name", ""),
+                "method_name": payload.get("method_name", ""),
+                "module": payload.get("module", ""),
+                "file_path": payload.get("file_path", ""),
+                "line_start": payload.get("line_start", 0),
+                "line_end": payload.get("line_end", 0),
+            },
+            "min_similarity": min_similarity,
+            "count": len(results),
+            "results": results,
+            "summary": {"indexed_methods": store.count()},
+        }
+
+    def search_similar_snippet(
+        self,
+        code: str,
+        limit: int = 5,
+        module: str = "",
+        min_similarity: float = 0.90,
+    ) -> dict:
+        """任意代码片段找项目里语义相近的方法（参考方案同名的 Tool 11）。"""
+        code = (code or "").strip()
+        limit = max(1, min(int(limit), 50))
+        base = {
+            "min_similarity": min_similarity,
+            "module": module,
+            "model": EMBED_MODEL,
+            "results": [],
+        }
+        if not code:
+            return {**base, "available": False, "hint": "code 不能为空"}
+        available, hint = self._vector_status()
+        if not available:
+            return {**base, "available": False, "hint": hint}
+        store = self._vectors()
+        try:
+            cache = self._cache()
+            dense = DenseEmbedder(cache).embed_query(snippet_text(code))
+        except EmbeddingUnavailable as exc:
+            return {**base, "available": False, "hint": str(exc)}
+        hits = store.search_dense(dense, limit * 2, module)
+        results = []
+        for hit in hits:
+            score = float(hit["score"])
+            if score < min_similarity:
+                continue
+            lines = max(1, hit["line_end"] - hit["line_start"] + 1)
+            body = self._method_body(
+                hit["file_path"], hit["line_start"], hit["method_name"]
+            )
+            results.append(
+                {
+                    **hit,
+                    "similarity": round(score, 4),
+                    "lines": lines,
+                    "advice": code_advice(score, lines, body),
+                    "source_code": self._read_source_range(
+                        hit["file_path"], hit["line_start"], hit["line_end"]
+                    ),
+                }
+            )
+            if len(results) >= limit:
+                break
+        return {
+            **base,
+            "available": True,
+            "count": len(results),
+            "results": results,
+            "summary": {"indexed_methods": store.count()},
         }
 
     def list_pages(self, module: str = "", limit: int = 100) -> dict:
