@@ -54,6 +54,19 @@ def _call(service: QueryService, case: dict) -> dict:
             limit=args.get("limit", 20),
             include_weak=args.get("include_weak", True),
         )
+    if kind == "find_similar_code":
+        return service.find_similar_code(
+            args["target"],
+            limit=args.get("limit", 10),
+            min_similarity=args.get("min_similarity", 0.3),
+        )
+    if kind == "find_duplicates":
+        return service.find_duplicates(
+            min_lines=args.get("min_lines", 6),
+            min_similarity=args.get("min_similarity", 0.8),
+            limit=args.get("limit", 20),
+            class_name=args.get("class_name", ""),
+        )
     if kind == "find_notifications":
         return service.find_notifications(
             name=args.get("name", ""),
@@ -131,6 +144,47 @@ def _check(data: dict, spec: dict) -> tuple[bool, str]:
 
     if kind == "trace_found":
         return bool(data.get("found")), f"found={data.get('found')}"
+
+    if kind == "similar_found":
+        return bool(data.get("found")), (
+            f"found={data.get('found')} hint={data.get('hint', '')}"
+        )
+
+    if kind in {"similar_top", "similar_contains"}:
+        results = data.get("results") or []
+        threshold = float(spec.get("min_similarity", 0.0))
+        if kind == "similar_top":
+            results = results[:1]
+        seen = [
+            f"{row.get('class_name')}.{row.get('method_name')}={row.get('similarity')}"
+            for row in results
+        ]
+        ok = any(
+            f"{row.get('class_name')}.{row.get('method_name')}" == spec["value"]
+            and float(row.get("similarity") or 0) >= threshold
+            for row in results
+        )
+        return ok, f"threshold={threshold} seen={seen}"
+
+    if kind == "duplicate_group":
+        wanted = set(spec["members"])
+        threshold = float(spec.get("min_similarity", 0.0))
+        for cluster in data.get("clusters") or []:
+            members = {
+                f"{row.get('class_name')}.{row.get('method_name')}"
+                for row in cluster.get("members") or []
+            }
+            if wanted <= members and float(cluster.get("similarity") or 0) >= threshold:
+                return True, (
+                    f"cluster kind={cluster.get('kind')} size={cluster.get('size')} "
+                    f"similarity={cluster.get('similarity')} members={sorted(members)}"
+                )
+        clusters = [
+            [f"{row.get('class_name')}.{row.get('method_name')}"
+             for row in cluster.get("members") or []]
+            for cluster in data.get("clusters") or []
+        ]
+        return False, f"missing {sorted(wanted)} in clusters={clusters}"
 
     if kind == "file_line_present":
         rows = data.get(spec.get("list", ""), [])

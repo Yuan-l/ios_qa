@@ -305,7 +305,7 @@
           "kind": "navigation_edge",
           "from": "QWeatherHomeViewController",
           "to": "QWeatherSearchViewController",
-          "line": 72,
+          "line": 73,
           "edge_kind": "push"
         }
       ],
@@ -536,6 +536,56 @@
         }
       ],
       "reason": "按模块消歧后，方法只能来自该模块，不能混进另一个同名类",
+      "last_reviewed": "2026-11-15"
+    },
+    {
+      "id": "similar-base-button",
+      "type": "find_similar_code",
+      "args": {
+        "target": "QWeatherBaseButton.initWithFrame:",
+        "limit": 10,
+        "min_similarity": 0.99
+      },
+      "checks": [
+        {
+          "kind": "similar_found"
+        },
+        {
+          "kind": "similar_top",
+          "value": "QWeatherBaseLabel.initWithFrame:",
+          "min_similarity": 0.99
+        },
+        {
+          "kind": "similar_contains",
+          "value": "QWeatherBaseTextField.initWithFrame:",
+          "min_similarity": 0.99
+        }
+      ],
+      "reason": "三个 Base 控件的 initWithFrame: 是同一段复制粘贴，归一化后指纹必须完全一致（改名、注释都不影响）",
+      "last_reviewed": "2026-11-15"
+    },
+    {
+      "id": "duplicates-swizzle",
+      "type": "find_duplicates",
+      "args": {
+        "min_lines": 18,
+        "min_similarity": 0.99,
+        "limit": 30
+      },
+      "checks": [
+        {
+          "kind": "duplicate_group",
+          "members": [
+            "NSNotificationCenter.swizzleMethod:withMethod:",
+            "NSUserDefaults.swizzleMethod:withMethod:",
+            "UIControl.swizzleMethod:withMethod:",
+            "UIGestureRecognizer.swizzleMethod:withMethod:",
+            "UIViewController.swizzleMethod:withMethod:"
+          ],
+          "min_similarity": 0.99
+        }
+      ],
+      "reason": "5 个 Category 的 swizzleMethod:withMethod: 逐字相同，必须被聚成同一组精确重复",
       "last_reviewed": "2026-11-15"
     }
   ]

@@ -16,6 +16,7 @@ from typing import Any, Iterable
 
 from .config import ProjectProfile
 from .db import connect, counts, get_metadata
+from .fingerprint import band_keys, decode_shingles, jaccard
 from .synonyms import expand_query, load_groups
 from .textnorm import build_search_text, fts_expr, like_pattern, snippet
 
@@ -58,6 +59,11 @@ def _class_row(row: sqlite3.Row, detail: bool = False) -> dict:
         data["interface_text"] = row["interface_text"]
         data["method_names"] = row["method_names"].split()
     return data
+
+
+def _shingle_ids(row: sqlite3.Row) -> set[int]:
+    """指纹行 -> shingle 集合（重复代码复核用）。"""
+    return decode_shingles(row["shingles"])
 
 
 def _method_row(row: sqlite3.Row, with_body: bool = False) -> dict:
@@ -1076,6 +1082,259 @@ class QueryService:
             "filter": {"module": module, "balanced": balanced},
             "summary": summary,
             "results": results,
+        }
+
+    # ------------------------------------------------------------------
+    # 相似代码 / 重复代码
+    # ------------------------------------------------------------------
+    def _fingerprint_rows(self) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM code_fingerprints ORDER BY class_name, method_name"
+        ).fetchall()
+
+    @staticmethod
+    def _fp_member(row: sqlite3.Row) -> dict:
+        line_start = row["line_start"] or 0
+        line_end = row["line_end"] or line_start
+        return {
+            "class_name": row["class_name"],
+            "method_name": row["method_name"],
+            "module": row["module"],
+            "file_path": row["file_path"],
+            "line_start": line_start,
+            "line_end": line_end,
+            "lines": max(1, line_end - line_start + 1),
+            "token_count": row["token_count"],
+            "shingle_count": row["shingle_count"],
+        }
+
+    def _resolve_code_target(self, target: str) -> list[sqlite3.Row]:
+        """把 ``Class.method`` / ``method`` 解析成指纹行（可能多行，按体积排序）。"""
+        target = (target or "").strip()
+        class_name, method_name = "", target
+        if "." in target:
+            class_name, method_name = target.split(".", 1)
+        sql = (
+            "SELECT * FROM code_fingerprints "
+            "WHERE (method_name = ? OR method_name LIKE ?)"
+        )
+        params: list[Any] = [method_name, method_name.split(":")[0] + "%"]
+        if class_name:
+            sql += " AND class_name = ?"
+            params.append(class_name)
+        sql += " ORDER BY token_count DESC LIMIT 5"
+        return self.conn.execute(sql, params).fetchall()
+
+    def find_similar_code(
+        self, target: str, limit: int = 10, min_similarity: float = 0.3
+    ) -> dict:
+        """找和 target 方法结构相近的方法（改过变量名也能认出来）。"""
+        target = (target or "").strip()
+        limit = max(1, min(int(limit), 100))
+        min_similarity = max(0.05, min(float(min_similarity), 1.0))
+        empty = {"target": target, "found": False, "results": [], "matches": []}
+        if not target:
+            return empty
+
+        matches = self._resolve_code_target(target)
+        if not matches:
+            hint = "没有这个方法的指纹：可能没有方法体、代码太短，或索引需要重建"
+            if self.conn.execute(
+                "SELECT 1 FROM classes WHERE class_name = ? COLLATE NOCASE",
+                (target.split(".")[0],),
+            ).fetchone():
+                hint = (
+                    "target 是类名：相似度按方法算，请用 Class.method，"
+                    "或先用 duplicates --class 看这个类里哪些方法有重复"
+                )
+            return {**empty, "hint": hint}
+
+        seed = matches[0]
+        seed_ids = _shingle_ids(seed)
+        seed_key = (seed["file_path"], seed["line_start"], seed["method_name"])
+        rows = self._fingerprint_rows()
+        scored: list[tuple[float, sqlite3.Row]] = []
+        for row in rows:
+            if (row["file_path"], row["line_start"], row["method_name"]) == seed_key:
+                continue
+            # 指纹只有千级，直接精确算 Jaccard，比 MinHash 粗筛更稳
+            score = jaccard(seed_ids, _shingle_ids(row))
+            if score >= min_similarity:
+                scored.append((score, row))
+        scored.sort(key=lambda item: (-item[0], item[1]["class_name"], item[1]["method_name"]))
+
+        results = []
+        for score, row in scored[:limit]:
+            member = self._fp_member(row)
+            member["similarity"] = round(score, 3)
+            member["exact"] = row["norm_hash"] == seed["norm_hash"]
+            member["same_class"] = row["class_name"] == seed["class_name"]
+            member["same_module"] = row["module"] == seed["module"]
+            results.append(member)
+
+        seed_member = self._fp_member(seed)
+        return {
+            "target": target,
+            "found": True,
+            "resolved": {
+                **seed_member,
+                "matched_from": target if target != (
+                    f"{seed['class_name']}.{seed['method_name']}"
+                ) else "",
+            },
+            "matches": [self._fp_member(row) for row in matches],
+            "min_similarity": min_similarity,
+            "count": len(results),
+            "results": results,
+            "summary": {
+                "fingerprinted": len(rows),
+                "above_threshold": len(scored),
+            },
+        }
+
+    def find_duplicates(
+        self,
+        min_lines: int = 6,
+        min_similarity: float = 0.8,
+        limit: int = 20,
+        class_name: str = "",
+    ) -> dict:
+        """聚类重复代码：精确复制 + 近似复制（默认 ≥80% 结构相同）。"""
+        limit = max(1, min(int(limit), 100))
+        min_lines = max(1, int(min_lines))
+        min_similarity = max(0.5, min(float(min_similarity), 1.0))
+        class_name = (class_name or "").strip()
+
+        sql = (
+            "SELECT * FROM code_fingerprints "
+            "WHERE (line_end - line_start + 1) >= ?"
+        )
+        params: list[Any] = [min_lines]
+        if class_name:
+            sql += " AND class_name = ?"
+            params.append(class_name)
+        rows = self.conn.execute(sql + " ORDER BY class_name, line_start", params).fetchall()
+
+        if len(rows) < 2:
+            return {
+                "min_lines": min_lines,
+                "min_similarity": min_similarity,
+                "summary": {
+                    "fingerprinted": len(rows), "clusters": 0,
+                    "exact": 0, "near": 0, "pairs": 0,
+                },
+                "clusters": [],
+            }
+
+        # 1) 精确复制：归一化 token 序列完全相同
+        by_hash: dict[str, list[int]] = {}
+        for index, row in enumerate(rows):
+            by_hash.setdefault(row["norm_hash"], []).append(index)
+
+        # 2) 近似复制：分带 LSH 出候选，再用 shingle 集合精确复核
+        buckets: dict[tuple, list[int]] = {}
+        for index, row in enumerate(rows):
+            for key in band_keys(row["signature"]):
+                buckets.setdefault(key, []).append(index)
+        pairs: set[tuple[int, int]] = set()
+        for members in buckets.values():
+            if len(members) < 2:
+                continue
+            for i in range(len(members)):
+                for j in range(i + 1, len(members)):
+                    pairs.add((members[i], members[j]))
+
+        ids_cache: dict[int, set[int]] = {}
+
+        def ids_of(index: int) -> set[int]:
+            if index not in ids_cache:
+                ids_cache[index] = _shingle_ids(rows[index])
+            return ids_cache[index]
+
+        verified: list[tuple[int, int, float]] = []
+        for left, right in pairs:
+            a, b = rows[left], rows[right]
+            tokens_a, tokens_b = a["token_count"] or 0, b["token_count"] or 0
+            if max(tokens_a, tokens_b) > 1.3 * max(1, min(tokens_a, tokens_b)):
+                continue  # 体量差太多，不可能是复制粘贴
+            score = jaccard(ids_of(left), ids_of(right))
+            if score >= min_similarity:
+                verified.append((left, right, score))
+
+        # 3) 连通分量 = 一组重复代码
+        parent = list(range(len(rows)))
+
+        def find(index: int) -> int:
+            while parent[index] != index:
+                parent[index] = parent[parent[index]]
+                index = parent[index]
+            return index
+
+        def union(left: int, right: int) -> None:
+            ra, rb = find(left), find(right)
+            if ra != rb:
+                parent[rb] = ra
+
+        for left, right, _ in verified:
+            union(left, right)
+        for members in by_hash.values():
+            if len(members) > 1:
+                for member in members[1:]:
+                    union(members[0], member)
+
+        clusters: dict[int, dict] = {}
+        for index, row in enumerate(rows):
+            root = find(index)
+            cluster = clusters.setdefault(
+                root,
+                {"members": [], "similarities": [], "hash": row["norm_hash"]},
+            )
+            cluster["members"].append(index)
+            if row["norm_hash"] != cluster["hash"]:
+                cluster["hash"] = ""
+        for left, right, score in verified:
+            clusters[find(left)]["similarities"].append(score)
+
+        out = []
+        for cluster in clusters.values():
+            members = cluster["members"]
+            if len(members) < 2:
+                continue
+            member_rows = sorted(
+                (rows[index] for index in members),
+                key=lambda row: (row["module"], row["class_name"], row["method_name"]),
+            )
+            kind = "exact" if cluster["hash"] else "near"
+            similarity = 1.0 if kind == "exact" else round(
+                min(cluster["similarities"] or [min_similarity]), 3
+            )
+            modules = sorted({row["module"] for row in member_rows})
+            out.append(
+                {
+                    "kind": kind,
+                    "size": len(member_rows),
+                    "similarity": similarity,
+                    "modules": modules,
+                    "cross_module": len(modules) > 1,
+                    "method_names": len({row["method_name"] for row in member_rows}),
+                    "members": [self._fp_member(row) for row in member_rows],
+                }
+            )
+
+        out.sort(key=lambda item: (-item["size"], -item["similarity"], item["kind"]))
+        exact_count = sum(1 for item in out if item["kind"] == "exact")
+        return {
+            "min_lines": min_lines,
+            "min_similarity": min_similarity,
+            "class_name": class_name,
+            "summary": {
+                "fingerprinted": len(rows),
+                "clusters": len(out),
+                "exact": exact_count,
+                "near": len(out) - exact_count,
+                "pairs": len(verified),
+            },
+            "clusters": out[:limit],
         }
 
     def list_pages(self, module: str = "", limit: int = 100) -> dict:

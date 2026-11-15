@@ -15,6 +15,8 @@
     python3 -m ios_qa module TDMonitorKit
     python3 -m ios_qa path TBFinanceDetailViewController
     python3 -m ios_qa notifications --unbalanced
+    python3 -m ios_qa similar QWeatherBaseButton.initWithFrame:
+    python3 -m ios_qa duplicates --min-lines 8
     python3 -m ios_qa qa save "问题" "答案"
     python3 -m ios_qa qa search "问题"
     python3 -m ios_qa eval
@@ -129,7 +131,8 @@ def cmd_build(args) -> int:
     print(f"  数据库: {report.db_path}")
     print(f"  文件: {report.files_total} 总 / {report.files_parsed} 解析 / "
           f"{report.files_skipped} 跳过 / {report.files_deleted} 删除")
-    print(f"  写入: symbols={report.symbols} methods={report.methods} classes={report.classes}")
+    print(f"  写入: symbols={report.symbols} methods={report.methods} "
+          f"classes={report.classes} fingerprints={report.fingerprints}")
     print("  统计: " + "  ".join(f"{k}={v}" for k, v in report.counts.items()))
     if report.errors:
         print(f"\n解析失败 {len(report.errors)} 个：")
@@ -486,6 +489,75 @@ def cmd_notifications(args) -> int:
     return 0
 
 
+def cmd_similar(args) -> int:
+    with _service(args) as service:
+        data = service.find_similar_code(
+            args.target, limit=args.limit, min_similarity=args.min_similarity
+        )
+    if args.json:
+        _dump(data)
+        return 0
+    if not data.get("found"):
+        print(f"没有找到「{args.target}」的代码指纹。")
+        if data.get("hint"):
+            print(f"  {data['hint']}")
+        return 0
+    seed = data["resolved"]
+    print(f"{seed['class_name']}.{seed['method_name']}  ({seed['lines']} 行)"
+          f"  {seed['file_path']}:{seed['line_start']}")
+    if seed.get("matched_from"):
+        print(f"  由「{seed['matched_from']}」匹配而来")
+    print(f"  指纹: {seed['token_count']} token / {seed['shingle_count']} shingle")
+    if not data["results"]:
+        print(f"  没有相似度 ≥ {data['min_similarity']:.2f} 的方法")
+        return 0
+    print()
+    for item in data["results"]:
+        if item["exact"]:
+            tag = "精确复制"
+        else:
+            tag = f"相似 {item['similarity']:.2f}"
+        where = "同类" if item["same_class"] else (
+            "同模块" if item["same_module"] else item["module"]
+        )
+        print(f"  {tag}  {item['class_name']}.{item['method_name']}"
+              f"  ({item['lines']} 行)  [{where}]")
+        print(f"    {item['file_path']}:{item['line_start']}")
+    return 0
+
+
+def cmd_duplicates(args) -> int:
+    with _service(args) as service:
+        data = service.find_duplicates(
+            min_lines=args.min_lines,
+            min_similarity=args.min_similarity,
+            limit=args.limit,
+            class_name=args.class_name or "",
+        )
+    if args.json:
+        _dump(data)
+        return 0
+    summary = data["summary"]
+    print(f"重复代码: {summary['clusters']} 组"
+          f"（精确 {summary['exact']} / 近似 {summary['near']}）"
+          f"  指纹 {summary['fingerprinted']} 个方法"
+          f"  复核 {summary['pairs']} 对")
+    if not data["clusters"]:
+        print(f"  没有 ≥{data['min_similarity']:.2f} 且 ≥{data['min_lines']} 行的重复")
+        return 0
+    for index, cluster in enumerate(data["clusters"], 1):
+        flag = "精确复制" if cluster["kind"] == "exact" else "近似复制"
+        extra = "  ⚠ 跨模块" if cluster["cross_module"] else ""
+        print(f"\n{index}. {flag}  x{cluster['size']}"
+              f"  相似度 {cluster['similarity']:.2f}"
+              f"  模块 {', '.join(cluster['modules'])}{extra}")
+        for member in cluster["members"]:
+            print(f"   {member['class_name']}.{member['method_name']}"
+                  f"  ({member['lines']} 行)")
+            print(f"     {member['file_path']}:{member['line_start']}")
+    return 0
+
+
 def cmd_qa(args) -> int:
     with _service(args) as service:
         if args.qa_action == "save":
@@ -618,7 +690,7 @@ def build_parser() -> argparse.ArgumentParser:
     common = _common_parser()
     parser = argparse.ArgumentParser(
         prog="ios_qa",
-        description="iOS 静态代码解析 + 知识库（P1：结构化索引 / 查询 / MCP）",
+        description="iOS 静态代码解析 + 知识库（结构化索引 / 查询 / 重复代码 / MCP）",
         parents=[common],
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -700,6 +772,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--unknown", action="store_true", help="只看无法判定")
     p.add_argument("--limit", type=int, default=100)
     p.set_defaults(func=cmd_notifications)
+
+    p = sub.add_parser("similar", parents=[common], help="找结构相近的方法（重复代码）")
+    p.add_argument("target", help="Class.method 或方法名")
+    p.add_argument("--min-similarity", dest="min_similarity", type=float, default=0.3)
+    p.add_argument("--limit", type=int, default=10)
+    p.set_defaults(func=cmd_similar)
+
+    p = sub.add_parser("duplicates", parents=[common], help="重复代码聚类")
+    p.add_argument("--min-lines", dest="min_lines", type=int, default=6)
+    p.add_argument("--min-similarity", dest="min_similarity", type=float, default=0.8)
+    p.add_argument("--class", dest="class_name", default="", help="只看某个类")
+    p.add_argument("--limit", type=int, default=20)
+    p.set_defaults(func=cmd_duplicates)
 
     p = sub.add_parser("qa", parents=[common], help="历史问答")
     qa_sub = p.add_subparsers(dest="qa_action", required=True)

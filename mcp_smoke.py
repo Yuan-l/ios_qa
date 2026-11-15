@@ -92,6 +92,13 @@ def _seeds(db_path: str | Path) -> dict[str, str]:
             "ORDER BY LENGTH(method_name) DESC, method_name LIMIT 1",
             default="",
         ),
+        # 取一个「有精确复制同伴」的方法：无论哪个工程，similar 都必然有结果
+        "fingerprint_target": one(
+            "SELECT class_name || '.' || method_name FROM code_fingerprints "
+            "GROUP BY norm_hash HAVING COUNT(*) > 1 "
+            "ORDER BY COUNT(*) DESC, class_name LIMIT 1",
+            default="",
+        ),
     }
     conn.close()
     if not seeds["page"]:
@@ -113,6 +120,15 @@ SERVICE_CALLS: dict[str, Callable[[QueryService, dict], Any]] = {
     ),
     "find_navigation": lambda s, a: s.find_navigation(
         a["target"], depth=a["depth"], limit=a["limit"]
+    ),
+    "find_similar_code": lambda s, a: s.find_similar_code(
+        a["target"], limit=a["limit"], min_similarity=a["min_similarity"]
+    ),
+    "find_duplicates": lambda s, a: s.find_duplicates(
+        min_lines=a["min_lines"],
+        min_similarity=a["min_similarity"],
+        limit=a["limit"],
+        class_name=a["class_name"],
     ),
     "find_notifications": lambda s, a: s.find_notifications(
         name=a["name"],
@@ -149,6 +165,17 @@ def build_cases(db_path: str | Path) -> list[dict]:
         "find_callers": {"target": cls, "limit": 20},
         "impact_analysis": {"target": cls, "depth": 2, "limit": 50},
         "find_navigation": {"target": seeds["page"], "depth": 6, "limit": 5},
+        "find_similar_code": {
+            "target": seeds["fingerprint_target"] or cls,
+            "limit": 5,
+            "min_similarity": 0.8,
+        },
+        "find_duplicates": {
+            "min_lines": 6,
+            "min_similarity": 0.8,
+            "limit": 5,
+            "class_name": "",
+        },
         "find_notifications": {
             "name": "",
             "module": seeds["module"],

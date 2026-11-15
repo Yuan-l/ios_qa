@@ -43,6 +43,7 @@ EXPECTED_TOOLS = {
     "kb_info", "find_feature", "search_symbol", "trace_class", "search_methods",
     "find_callers", "impact_analysis", "read_source", "list_pages",
     "list_module", "search_qa", "save_qa", "find_navigation", "find_notifications",
+    "find_similar_code", "find_duplicates",
 }
 
 
@@ -118,6 +119,27 @@ class McpTest(unittest.TestCase):
             return str(result)
 
         output = asyncio.run(run())
+        self.assertIn("summary", output)
+
+    def test_call_find_similar_code(self) -> None:
+        async def run() -> str:
+            result = await mcp_server.mcp.call_tool(
+                "find_similar_code", {"target": "TBWidget.reload"}
+            )
+            return str(result)
+
+        output = asyncio.run(run())
+        self.assertIn("found", output)
+
+    def test_call_find_duplicates(self) -> None:
+        async def run() -> str:
+            result = await mcp_server.mcp.call_tool(
+                "find_duplicates", {"min_lines": 3, "min_similarity": 0.8}
+            )
+            return str(result)
+
+        output = asyncio.run(run())
+        self.assertIn("clusters", output)
         self.assertIn("summary", output)
 
 

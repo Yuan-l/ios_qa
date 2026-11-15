@@ -1,11 +1,12 @@
-# ios_qa — iOS 静态解析 + 知识库（P1 / P2）
+# ios_qa — iOS 静态解析 + 知识库（P1 / P2 / P3）
 
 纯 Python 词法扫描，把 iOS 工程解析成 SQLite 结构化索引，提供：
 
 - **结构化索引**：类/协议/扩展、方法体、依赖、调用边、页面入口、跳转、通知、API 端点
 - **中文全文检索**：CJK 单字 + bigram 预分词，不依赖 jieba；支持业务别名扩展
 - **查询 CLI**：功能检索、符号、调用、影响面、页面入口路径、通知配对
-- **MCP server**：14 个工具，可直接接任意支持 stdio 的 MCP 客户端
+- **重复/相似代码**：词法指纹（改局部变量名也能认出复制粘贴），精确 + 近似重复聚类
+- **MCP server**：16 个工具，可直接接任意支持 stdio 的 MCP 客户端
 
 查询层（`query.py`）不依赖 CLI / MCP，后续接 Agent Loom 只需换接入层。
 
@@ -25,7 +26,7 @@ python3 -m ios_qa build --check
 # 自检
 python3 -m ios_qa doctor
 
-# 模型无关的 golden 验收（27 个用例，不调用任何 LLM）
+# 模型无关的 golden 验收（29 个用例，不调用任何 LLM）
 python3 -m ios_qa eval
 
 # MCP 双客户端验收（协议层 + 数据层，失败退出码 1）
@@ -42,6 +43,8 @@ python3 -m ios_qa pages
 python3 -m ios_qa module TDMonitorKit
 python3 -m ios_qa path TBFinanceDetailViewController
 python3 -m ios_qa notifications --unbalanced
+python3 -m ios_qa similar QWeatherBaseButton.initWithFrame:
+python3 -m ios_qa duplicates --min-lines 8
 ```
 
 索引默认落在 `ios_qa/.data/ios_qa.db`（已加入 `.gitignore`）。
@@ -75,6 +78,8 @@ python3 -m ios_qa notifications --unbalanced
 | `pages` | 列出 UIViewController 子类 |
 | `path <类>` | 从已知入口到该页面的跳转链；`--depth` / `--limit` / `--no-weak` |
 | `notifications [名称]` | 通知注册/移除配对；`--module` / `--unbalanced` / `--unknown` |
+| `similar <目标>` | 找结构相近的方法；`--min-similarity`（默认 0.3）/ `--limit` |
+| `duplicates` | 重复代码聚类；`--min-lines`（默认 6）/ `--min-similarity`（默认 0.8）/ `--class` |
 | `module <名称>` | 模块概览 |
 | `qa save/search/delete` | 历史问答知识库 |
 | `mcp` | 启动 MCP stdio server |
@@ -150,6 +155,8 @@ MCP 是协议，不绑定客户端：OpenCode、Cursor、Claude Code、自研 Ag
 | `list_pages` | 页面列表 |
 | `find_navigation` | 入口 → 页面的跳转链（含低置信度实例化边） |
 | `find_notifications` | 通知注册/移除查询，`unbalanced_only` 只看未配对 |
+| `find_similar_code` | 结构相近的方法（改过变量名也能认出来），`min_similarity` 默认 0.3 |
+| `find_duplicates` | 重复代码聚类，`min_lines` / `min_similarity` / `class_name` |
 | `list_module` | 模块概览 |
 | `search_qa` | 检索历史问答 |
 | `save_qa` | 保存问答 |
@@ -175,7 +182,7 @@ MCP 是协议，不绑定客户端：OpenCode、Cursor、Claude Code、自研 Ag
 schema，不在真实索引里造数据。
 
 ```bash
-python3 -m ios_qa mcp-smoke                 # 两个客户端 + 13 个只读工具
+python3 -m ios_qa mcp-smoke                 # 两个客户端 + 15 个只读工具
 python3 -m ios_qa mcp-smoke --client raw    # 只跑 stdlib 客户端
 python3 -m ios_qa mcp-smoke --only trace_class
 python3 -m ios_qa mcp-smoke --json          # CI 消费
@@ -187,17 +194,19 @@ python3 -m ios_qa mcp-smoke --json          # CI 消费
 MCP 验收：TrueDepthDemo2  (ios_qa/.data/ios_qa.db)
 
 协议层
-  ✅ raw-jsonrpc  14 个工具  服务端 ios_qa / 协议 2024-11-05
-  ✅ python-sdk  14 个工具  服务端 ios_qa / 协议 2025-11-25
-  工具集合一致: 是（14 个）
+  ✅ raw-jsonrpc  16 个工具  服务端 ios_qa / 协议 2024-11-05
+  ✅ python-sdk  16 个工具  服务端 ios_qa / 协议 2025-11-25
+  工具集合一致: 是（16 个）
 
 数据层（客户端返回 vs QueryService 直接调用）
   ✅ kb_info              与查询层逐字段一致
   ✅ find_feature         与查询层逐字段一致
+  ✅ find_similar_code    与查询层逐字段一致
+  ✅ find_duplicates      与查询层逐字段一致
   ...
   ⏭  save_qa              写路径只验协议
 
-通过 13/13 个工具（失败 0）；协议层通过
+通过 15/15 个工具（失败 0）；协议层通过
 ```
 
 验收参数不写死类名：`build_cases()` 从索引里取样（方法最多的类、页面、模块、
@@ -220,7 +229,8 @@ ios_qa/
 │   ├── objc.py        .h/.m/.mm：interface/category/协议/方法体/通知/导航
 │   ├── swift.py       class/struct/enum/protocol/extension/actor
 │   └── ui.py          storyboard/xib：入口与 segue
-├── db.py              DDL、增量写入、classes 聚合、FTS 重建
+├── fingerprint.py     代码指纹：token 归一化、MinHash、LSH 分带、Jaccard
+├── db.py              DDL、增量写入、classes 聚合、指纹重建、FTS 重建
 ├── build.py           构建编排、git 元数据、build_runs
 ├── query.py           查询服务（纯 Python API）
 ├── cli.py             argparse 入口
@@ -235,7 +245,8 @@ ios_qa/
 `symbols`、`methods`、`deps`、`api_calls`、`notifications`、`calls`、`entrypoints`、`navigation`
 
 聚合/辅助表：
-`classes`（每次构建重建）、`files`、`metadata`、`build_runs`、`qa_history`
+`classes`（每次构建重建）、`code_fingerprints`（按方法体增量补算）、`files`、
+`metadata`、`build_runs`、`qa_history`
 
 FTS5 虚表：
 `classes_fts`、`methods_fts`、`qa_fts`（全量重建，数据量级下成本可接受）
@@ -353,6 +364,48 @@ self.viewControllers = @[nav1, nav2];
 
 `UINavigationController` 及其子类（`TBNavigationController` 等）会自动解包到
 内层页面，边类型记为 `tab`（强边）。
+
+### 重复 / 相似代码（P3-a）
+
+重复代码判断的是「结构是不是一样」，不是「语义像不像」，所以这里不用向量，
+用纯 stdlib 的词法指纹，结果可复现、不依赖模型：
+
+1. **归一化 token**：去注释；字符串统一成 `str`（含 ObjC `@"..."`）、数字统一
+   成 `num`；标识符按驼峰/下划线拆成小写段并丢掉单字母（循环变量改名不影响）。
+2. **精确重复**：归一化 token 序列的 sha1（`code_fingerprints.norm_hash`）。
+3. **近似重复**：token 4-gram + MinHash（16 个排列）签名，8 个带各 2 行做
+   LSH 出候选；候选再用 shingle 集合算**精确 Jaccard** 复核——报告出来的
+   `similarity` 是真实集合相似度，不是 MinHash 估计值。
+4. **过滤**：token 少于 24 的方法不做指纹（`super.init()` 这类样板全仓库一样）；
+   两个方法 token 数差超过 1.3 倍直接淘汰。
+
+```bash
+# 精确复制（相似度 1.0）：三个 Base 控件的 initWithFrame: 是同一段代码
+python3 -m ios_qa similar QWeatherBaseButton.initWithFrame:
+# 近似/精确重复聚类（默认 ≥6 行、≥0.8 结构相同）
+python3 -m ios_qa duplicates --min-lines 8
+```
+
+```
+$ python3 -m ios_qa duplicates --min-lines 10 --limit 1
+重复代码: 11 组（精确 4 / 近似 7）  指纹 939 个方法  复核 55 对
+
+1. 近似复制  x12  相似度 0.80  模块 MyCameraModule
+   ImageEditorViewController.applyAnimeTemplate  (10 行)
+     components/MyCameraModule/ViewController/ImageEditorViewController.swift:380
+   ...
+```
+
+- 指纹按 `(file_path, line_start, method_name)` 与 `methods` 对齐，body 没变
+  就不重算（增量构建通常 `fingerprints=0`）；
+- 一组重复用并查集聚成连通分量，`kind=exact` 要求全组哈希相同，
+  否则 `near` 且 `similarity` 取组内最低的复核值；跨模块的组会标
+  `cross_module=true`；
+- 实测本仓库：1452 个指纹 / 约 0.75 MB blob，全量计算约 1.6s；
+  `duplicates` 查询约 0.1s。
+
+已知边界：改名、改注释、换字面量都还能命中；**换一种实现思路**（结构不同）
+不会命中，这是词法指纹的固有边界，语义相似留给 P3-b 的向量层。
 
 ---
 
@@ -484,6 +537,9 @@ python3 -m ios_qa build --check
 | `ambiguous` | `trace` 判定为同名类，且候选声明点不少于 `min` 个 |
 | `candidate_modules` | `candidates` 覆盖 `values` 里的全部模块 |
 | `all_methods_module` | `methods` 全部来自指定模块 |
+| `similar_found` | `similar` 找到了目标方法的指纹 |
+| `similar_top` / `similar_contains` | 相似结果首条 / 任意一条是 `value`，且 `similarity` ≥ `min_similarity` |
+| `duplicate_group` | 某一重复组覆盖 `members` 全部类.方法，且 `similarity` ≥ `min_similarity` |
 
 ### 维护策略
 
@@ -519,10 +575,12 @@ eval 失败
 
 | 项目 | 结果 |
 |---|---|
-| 全量构建耗时 | 约 3~4s（364 文件 / 5.1 万行） |
+| 全量构建耗时 | 约 5s（364 文件 / 5.1 万行，含代码指纹） |
 | 重复构建 | `files_parsed=0`，计数不变 |
 | 解析失败 | 0 |
-| 索引规模 | 352 类 / 2266 方法 / 4119 调用边 / 1102 依赖边 / 64 导航边 / 21 通知 |
+| 索引规模 | 352 类 / 2271 方法 / 4138 调用边 / 1105 依赖边 / 64 导航边 / 21 通知 |
+| 代码指纹 | 1452 个方法（约 0.75 MB blob），全量 1.6s；`duplicates` 约 0.1s |
+| 重复代码 | 21 组（精确 13 / 近似 8），含 5 个 Category 的 `swizzleMethod:withMethod:` |
 | 关键词验证 | 中文 FTS 命中；头文件/实现/调用方行号与源码一致 |
 | 入口路径 | `path TBFinanceDetailViewController`：AppDelegate --tab@58--> 行情首页 --push@838--> 详情页 |
 | 通知配对 | 未配对 1 条：`CameraViewController.tbLanguageDidChange`（只注册不移除） |
@@ -530,10 +588,10 @@ eval 失败
 | 协议/block 调用 | `delegate?.captureOutput` → `CameraCaptureViewModelDelegate`；`onSelect` 4 处 block 调用 |
 | 分类归属 | `search_symbol("BreadCrumb")` 命中 `UIViewController` 等 5 个宿主类 |
 | 同名类消歧 | `trace TBTabbarViewController` 返回 2 个声明点，`--module` 切换后方法不串模块 |
-| `eval` golden 用例 | **27/27 通过**（不依赖任何模型） |
-| MCP 双客户端验收 | `raw-jsonrpc` 与 `python-sdk` 各 14 个工具；13 个只读工具与查询层逐字段一致 |
+| `eval` golden 用例 | **29/29 通过**（不依赖任何模型） |
+| MCP 双客户端验收 | `raw-jsonrpc` 与 `python-sdk` 各 16 个工具；15 个只读工具与查询层逐字段一致 |
 | UI 文案检索 | `find_feature("行情")` 命中 `TBFinanceHomeViewController`；注释里的中文不进类级检索 |
-| 测试 | 68 个 unittest 全部通过 |
+| 测试 | 87 个 unittest 全部通过 |
 
 手动抽查建议：
 
@@ -560,7 +618,8 @@ python3 -m ios_qa notifications --unbalanced
   属性仍是启发式，`confidence=low`；
 - 同名类在 `classes` 里仍是一行（`method_count` 是合并值），
   `trace --module` 只收敛查询结果，不改写聚合表；
-- 向量检索、相似代码、重复扫描（参考系统的 6 个工具）留到 P3；
+- 重复/相似代码用**词法指纹**判定结构一致，不做语义等价（改名能命中，换实现思路不命中）；
+- 向量语义检索留到 P3-b，可不依赖模型默认关闭；
 - 不解析 Objective-C++ 模板细节与宏展开。
 
 ## 后续
@@ -583,4 +642,8 @@ python3 -m ios_qa notifications --unbalanced
 - **P2-d（已完成）**：同名类消歧 —— 识别多个声明点、`trace --module` 收敛；
   界面文案进类级检索（`symbols.literals_json`）；`path` 同链去重；golden 扩到
   27 条；
-- **P3**：向量层（`sqlite-vec` 或外部索引）+ 相似代码/重复扫描 + Agent Loom 接入。
+- **P3-a（已完成）**：相似代码 / 重复扫描 —— `code_fingerprints` 表、MinHash + LSH
+  出候选、shingle 集合精确复核；`similar` / `duplicates` / `find_similar_code` /
+  `find_duplicates`；golden 扩到 29 条；
+- **P3-b**：向量语义检索（SQLite BLOB + Python 余弦，可插拔 embed provider，
+  默认关闭）+ Agent Loom 接入。

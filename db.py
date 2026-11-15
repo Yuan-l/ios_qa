@@ -22,6 +22,7 @@ from pathlib import Path
 
 from . import SCHEMA_VERSION
 from .config import ProjectProfile
+from .fingerprint import fingerprint
 from .model import ParseResult
 from .textnorm import build_search_text
 
@@ -231,6 +232,25 @@ CREATE TABLE IF NOT EXISTS qa_history (
     search_text    TEXT DEFAULT ''
 );
 
+CREATE TABLE IF NOT EXISTS code_fingerprints (
+    file_path     TEXT NOT NULL,
+    line_start    INTEGER NOT NULL,
+    method_name   TEXT NOT NULL,
+    class_name    TEXT DEFAULT '',
+    module        TEXT DEFAULT '',
+    language      TEXT DEFAULT '',
+    line_end      INTEGER DEFAULT 0,
+    token_count   INTEGER DEFAULT 0,
+    shingle_count INTEGER DEFAULT 0,
+    norm_hash     TEXT DEFAULT '',
+    body_hash     TEXT DEFAULT '',
+    signature     BLOB,
+    shingles      BLOB,
+    PRIMARY KEY(file_path, line_start, method_name)
+);
+CREATE INDEX IF NOT EXISTS idx_fp_class ON code_fingerprints(class_name);
+CREATE INDEX IF NOT EXISTS idx_fp_norm ON code_fingerprints(norm_hash);
+
 CREATE TABLE IF NOT EXISTS build_runs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     started_at  TEXT DEFAULT '',
@@ -278,6 +298,7 @@ FILE_SCOPED_TABLES = (
     "calls",
     "entrypoints",
     "navigation",
+    "code_fingerprints",
 )
 
 
@@ -316,7 +337,7 @@ def reset_all(conn: sqlite3.Connection) -> None:
     for table in (
         "symbols", "methods", "deps", "api_calls", "notifications", "calls",
         "entrypoints", "navigation", "classes", "files", "build_runs",
-        "classes_fts", "methods_fts",
+        "code_fingerprints", "classes_fts", "methods_fts",
     ):
         conn.execute(f"DELETE FROM {table}")
     conn.commit()
@@ -745,6 +766,71 @@ def rebuild_classes(conn: sqlite3.Connection, profile: ProjectProfile) -> int:
     return len(rows_out)
 
 
+def rebuild_fingerprints(conn: sqlite3.Connection) -> int:
+    """按需补算代码指纹；body 未变的方法直接跳过（增量构建通常一个都不算）。
+
+    指纹只依赖方法体，所以和 ``methods.body_hash`` 对齐：新方法、body 变了、
+    方法被删掉，三种情况都在这里收敛。
+    """
+    conn.execute(
+        "DELETE FROM code_fingerprints "
+        "WHERE file_path NOT IN (SELECT path FROM files)"
+    )
+    rows = conn.execute(
+        """
+        SELECT m.file_path, m.line_start, m.line_end, m.method_name, m.class_name,
+               m.module, m.language, m.body, m.body_hash,
+               f.body_hash AS fp_hash
+        FROM methods m
+        LEFT JOIN code_fingerprints f
+          ON f.file_path = m.file_path AND f.line_start = m.line_start
+         AND f.method_name = m.method_name
+        WHERE m.has_body = 1
+        """
+    ).fetchall()
+    written = 0
+    for row in rows:
+        if row["fp_hash"] == row["body_hash"]:
+            continue
+        key = (row["file_path"], row["line_start"], row["method_name"])
+        fp = fingerprint(row["body"] or "", row["language"] or "objc")
+        if fp is None:
+            conn.execute(
+                "DELETE FROM code_fingerprints "
+                "WHERE file_path = ? AND line_start = ? AND method_name = ?",
+                key,
+            )
+            continue
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO code_fingerprints(
+                file_path, line_start, method_name, class_name, module, language,
+                line_end, token_count, shingle_count, norm_hash, body_hash,
+                signature, shingles
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                *key, row["class_name"], row["module"], row["language"],
+                row["line_end"], fp.token_count, fp.shingle_count, fp.norm_hash,
+                row["body_hash"], fp.signature, fp.shingles,
+            ),
+        )
+        written += 1
+    conn.execute(
+        """
+        DELETE FROM code_fingerprints WHERE NOT EXISTS (
+            SELECT 1 FROM methods m
+            WHERE m.file_path = code_fingerprints.file_path
+              AND m.line_start = code_fingerprints.line_start
+              AND m.method_name = code_fingerprints.method_name
+              AND m.has_body = 1
+        )
+        """
+    )
+    conn.commit()
+    return written
+
+
 def set_metadata(conn: sqlite3.Connection, values: dict[str, str]) -> None:
     conn.executemany(
         "INSERT INTO metadata(key, value) VALUES (?,?) "
@@ -763,6 +849,7 @@ def counts(conn: sqlite3.Connection) -> dict[str, int]:
     for table in (
         "files", "symbols", "classes", "methods", "deps", "api_calls",
         "notifications", "calls", "entrypoints", "navigation", "qa_history",
+        "code_fingerprints",
     ):
         result[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
     return result

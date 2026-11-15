@@ -24,6 +24,7 @@ iOS 工程静态知识库。回答代码问题前优先用这里的工具定位�
 - 找功能/页面：find_feature（支持中文描述）
 - 查类结构/调用链/通知/API：trace_class
 - 查方法：search_methods；查谁调用：find_callers；评估改动影响：impact_analysis
+- 找复制粘贴：find_similar_code（单方法）/ find_duplicates（全仓库聚类）
 - 需要精确行号时用 read_source 读原文件
 所有结果都带 file_path 与行号。
 """
@@ -142,6 +143,46 @@ def find_notifications(
                 module=module,
                 balanced=0 if unbalanced_only else None,
                 limit=limit,
+            )
+        )
+
+
+@mcp.tool()
+def find_similar_code(
+    target: str, limit: int = 10, min_similarity: float = 0.3
+) -> str:
+    """找结构相近的方法：改过变量名/注释的复制粘贴也能认出来。
+
+    ``target`` 用 ``Class.method`` 或方法名。相似度按归一化 token 的
+    shingle 集合算精确 Jaccard，不是估计值。
+    """
+    with _service() as service:
+        return _dump(
+            service.find_similar_code(
+                target, limit=limit, min_similarity=min_similarity
+            )
+        )
+
+
+@mcp.tool()
+def find_duplicates(
+    min_lines: int = 6,
+    min_similarity: float = 0.8,
+    limit: int = 20,
+    class_name: str = "",
+) -> str:
+    """重复代码聚类：精确复制 + 近似复制（默认 ≥80% 结构相同、≥6 行）。
+
+    返回 ``clusters``，每组带 ``members``（类.方法 + 文件行号）与
+    ``cross_module``；``class_name`` 可只看某个类。
+    """
+    with _service() as service:
+        return _dump(
+            service.find_duplicates(
+                min_lines=min_lines,
+                min_similarity=min_similarity,
+                limit=limit,
+                class_name=class_name,
             )
         )
 

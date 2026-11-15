@@ -20,6 +20,7 @@ from .db import (
     ensure_schema,
     get_metadata,
     rebuild_classes,
+    rebuild_fingerprints,
     reset_all,
     set_metadata,
     write_result,
@@ -41,6 +42,7 @@ class BuildReport:
     symbols: int = 0
     methods: int = 0
     classes: int = 0
+    fingerprints: int = 0
     errors: list[dict] = field(default_factory=list)
     counts: dict[str, int] = field(default_factory=dict)
     git_branch: str = ""
@@ -59,6 +61,7 @@ class BuildReport:
             "symbols": self.symbols,
             "methods": self.methods,
             "classes": self.classes,
+            "fingerprints": self.fingerprints,
             "errors": self.errors,
             "counts": self.counts,
             "git_branch": self.git_branch,
@@ -217,6 +220,7 @@ def build(
 
     report.files_parsed = parsed_count
     report.classes = rebuild_classes(conn, profile)
+    report.fingerprints = rebuild_fingerprints(conn)
     report.counts = counts(conn)
     report.duration_s = time.perf_counter() - started
 
