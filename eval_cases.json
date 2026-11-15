@@ -253,6 +253,143 @@
       ],
       "reason": "索引健康基线：方法数为 0 或类数量异常时查询不可用",
       "last_reviewed": "2026-11-15"
+    },
+    {
+      "id": "navigation-finance-detail",
+      "type": "find_navigation",
+      "args": {
+        "target": "TBFinanceDetailViewController",
+        "depth": 6,
+        "limit": 10
+      },
+      "checks": [
+        {
+          "kind": "navigation_reachable"
+        },
+        {
+          "kind": "navigation_edge",
+          "from": "AppDelegate",
+          "to": "TBFinanceHomeViewController",
+          "line": 48,
+          "edge_kind": "instantiate"
+        },
+        {
+          "kind": "navigation_edge",
+          "from": "TBFinanceHomeViewController",
+          "to": "TBFinanceDetailViewController",
+          "line": 793,
+          "edge_kind": "push"
+        }
+      ],
+      "reason": "行情详情页入口链：tab 内创建是弱边、页面跳转是强边，两者要能连起来",
+      "last_reviewed": "2026-11-15"
+    },
+    {
+      "id": "navigation-weather-search",
+      "type": "find_navigation",
+      "args": {
+        "target": "QWeatherSearchViewController"
+      },
+      "checks": [
+        {
+          "kind": "navigation_reachable"
+        },
+        {
+          "kind": "navigation_edge",
+          "from": "AppDelegate",
+          "to": "TBTabbarViewController",
+          "line": 63,
+          "edge_kind": "root"
+        },
+        {
+          "kind": "navigation_edge",
+          "from": "QWeatherHomeViewController",
+          "to": "QWeatherSearchViewController",
+          "line": 72,
+          "edge_kind": "push"
+        }
+      ],
+      "reason": "纯强边入口链：AppDelegate → Tab → 天气首页 → 搜索页",
+      "last_reviewed": "2026-11-15"
+    },
+    {
+      "id": "notifications-unbalanced",
+      "type": "find_notifications",
+      "args": {
+        "balanced": 0
+      },
+      "checks": [
+        {
+          "kind": "notification_contains",
+          "class": "CameraViewController",
+          "name": "tbLanguageDidChange"
+        },
+        {
+          "kind": "summary_gte",
+          "field": "unbalanced",
+          "value": 1
+        }
+      ],
+      "reason": "只注册不移除的通知必须能被查出来（真实泄漏点）",
+      "last_reviewed": "2026-11-15"
+    },
+    {
+      "id": "notifications-by-name",
+      "type": "find_notifications",
+      "args": {
+        "name": "KNotificationChangeTextSetting",
+        "limit": 50
+      },
+      "checks": [
+        {
+          "kind": "min_results",
+          "value": 4
+        }
+      ],
+      "reason": "按通知名反查注册方：语言/字号变更通知有多个基类观察者",
+      "last_reviewed": "2026-11-15"
+    },
+    {
+      "id": "synonym-quote-page",
+      "type": "find_feature",
+      "args": {
+        "query": "报价",
+        "limit": 10
+      },
+      "checks": [
+        {
+          "kind": "class_in_results",
+          "value": "TBFinanceHomeViewController"
+        },
+        {
+          "kind": "synonyms_applied",
+          "from": "报价",
+          "to": "行情"
+        }
+      ],
+      "reason": "业务别名：报价≈行情，要能找到行情页而不只是 Quote 模型",
+      "last_reviewed": "2026-11-15"
+    },
+    {
+      "id": "synonym-jank",
+      "type": "find_feature",
+      "args": {
+        "query": "jank",
+        "limit": 10
+      },
+      "checks": [
+        {
+          "kind": "class_in_results",
+          "value": "TDLongTaskMonitor"
+        },
+        {
+          "kind": "synonyms_applied",
+          "from": "jank",
+          "to": "卡顿"
+        }
+      ],
+      "reason": "英文别名 jank 要能映射到中文卡顿，命中长任务监控",
+      "last_reviewed": "2026-11-15"
     }
   ]
 }

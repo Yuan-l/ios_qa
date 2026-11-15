@@ -7,6 +7,7 @@ from __future__ import annotations
 import unittest
 
 from ios_qa.textnorm import build_search_text, fts_expr, like_pattern, snippet, tokenize
+from ios_qa.synonyms import expand_query, load_groups
 
 
 class TokenizeTest(unittest.TestCase):
@@ -59,6 +60,31 @@ class SnippetTest(unittest.TestCase):
         result = snippet(text, "数据", width=20)
         self.assertIn("数据", result)
         self.assertLessEqual(len(result), 30)
+
+
+class SynonymTest(unittest.TestCase):
+    GROUPS = [
+        ["行情", "报价", "quote"],
+        ["崩溃", "crash"],
+    ]
+
+    def test_expands_to_other_terms(self) -> None:
+        result = expand_query("报价 页面", self.GROUPS)
+        targets = {item["to"] for item in result}
+        self.assertIn("行情", targets)
+        self.assertIn("quote", targets)
+        self.assertTrue(all(item["query"] != "报价 页面" for item in result))
+
+    def test_no_match_returns_empty(self) -> None:
+        self.assertEqual(expand_query("摄像头", self.GROUPS), [])
+
+    def test_limit_caps_expansions(self) -> None:
+        result = expand_query("报价 崩溃", self.GROUPS, limit=2)
+        self.assertEqual(len(result), 2)
+
+    def test_default_groups_load(self) -> None:
+        groups = load_groups()
+        self.assertTrue(any("行情" in group for group in groups))
 
 
 if __name__ == "__main__":

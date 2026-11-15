@@ -16,6 +16,7 @@ from typing import Any, Iterable
 
 from .config import ProjectProfile
 from .db import connect, counts, get_metadata
+from .synonyms import expand_query, load_groups
 from .textnorm import build_search_text, fts_expr, like_pattern, snippet
 
 
@@ -84,6 +85,7 @@ class QueryService:
         self.db_path = Path(db_path) if db_path else profile.resolved_db_path
         self.conn = connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
+        self.synonym_groups = load_groups(profile)
 
     def close(self) -> None:
         self.conn.close()
@@ -162,11 +164,15 @@ class QueryService:
     # ------------------------------------------------------------------
     # 功能 / 符号
     # ------------------------------------------------------------------
-    def find_feature(self, query: str, limit: int = 10) -> dict:
-        query = (query or "").strip()
-        if not query:
-            return {"query": query, "results": []}
-        limit = max(1, min(int(limit), 50))
+    def _feature_scores(
+        self,
+        query: str,
+        limit: int,
+        penalty: float = 0.0,
+        matched_suffix: str = "",
+        allow_like: bool = True,
+    ) -> dict[str, dict]:
+        """类名 / FTS / 方法体 / 入口四路打分，返回 ``class_name -> 结果``。"""
         scores: dict[str, dict] = {}
 
         def add(row: sqlite3.Row, score: float, matched_on: str, extra: dict | None = None) -> None:
@@ -176,12 +182,14 @@ class QueryService:
                 score += 4
             if data["is_app_entry"]:
                 score += 3
+            score -= penalty
+            matched = f"{matched_on}{matched_suffix}"
             existing = scores.get(key)
             if existing is None or score > existing["score"]:
                 scores[key] = {
                     **data,
                     "score": round(score, 2),
-                    "matched_on": matched_on,
+                    "matched_on": matched,
                     **(extra or {}),
                 }
             elif extra:
@@ -217,7 +225,10 @@ class QueryService:
             ).fetchall()
             for row in rows:
                 rank = row["rank"] if row["rank"] is not None else 0
-                add(row, 50 - max(-20.0, min(20.0, rank)), f"fts_{op.lower()}",
+                # OR 是「部分命中」的兜底，不能和 AND 同分，否则会把
+                # 只沾一个词的类顶到同义/精确命中前面。
+                base = 50 if op == "AND" else 44
+                add(row, base - max(-20.0, min(20.0, rank)), f"fts_{op.lower()}",
                     {"snippet": snippet(row["doc_comment"] or row["search_text"], query)})
             if rows:
                 break
@@ -243,7 +254,7 @@ class QueryService:
                 ).fetchone()
                 if cls is None:
                     continue
-                add(cls, 35 - max(-15.0, min(15.0, row["rank"] or 0)),
+                add(cls, (35 if op == "AND" else 30) - max(-15.0, min(15.0, row["rank"] or 0)),
                     "method_fts",
                     {
                         "matched_method": row["method_name"],
@@ -269,7 +280,7 @@ class QueryService:
                                     "source": entry["source"], "file_path": entry["file_path"]}})
 
         # 5. LIKE 兜底（无法分词 / 极短查询）
-        if not scores:
+        if allow_like and not scores:
             pattern = like_pattern(query)
             rows = self.conn.execute(
                 """
@@ -283,10 +294,49 @@ class QueryService:
             for row in rows:
                 add(row, 30, "like")
 
+        return scores
+
+    def find_feature(self, query: str, limit: int = 10) -> dict:
+        query = (query or "").strip()
+        if not query:
+            return {"query": query, "results": []}
+        limit = max(1, min(int(limit), 50))
+        scores = self._feature_scores(query, limit)
+
+        # 业务别名扩展：行情↔报价、崩溃↔crash、卡顿↔掉帧 …
+        # 只在该查询字面命中明显不足时启用（最高分 < 55）：像「首页」这种
+        # 直接命中很强的查询，扩展成 home 反而会灌进一堆 QWeatherHome* 视图。
+        applied: list[dict] = []
+        seen_pairs: set[tuple[str, str]] = set()
+        primary_max = max((item["score"] for item in scores.values()), default=0.0)
+        if not scores or primary_max < 55:
+            for expansion in expand_query(query, self.synonym_groups):
+                weak = self._feature_scores(
+                    expansion["query"], limit, penalty=2.0,
+                    matched_suffix="_synonym", allow_like=False,
+                )
+                if not weak:
+                    continue
+                pair = (expansion["from"], expansion["to"])
+                if pair not in seen_pairs:
+                    seen_pairs.add(pair)
+                    applied.append({"from": expansion["from"], "to": expansion["to"]})
+                label = f"{expansion['from']}→{expansion['to']}"
+                for key, item in weak.items():
+                    existing = scores.get(key)
+                    if existing is None:
+                        item["synonym"] = label
+                        scores[key] = item
+                    elif "synonym" not in existing:
+                        existing["synonym"] = label
+
         results = sorted(scores.values(), key=lambda x: (-x["score"], x["class_name"]))[:limit]
         for item in results:
             item["methods"] = self._top_methods(item["class_name"], 5)
-        return {"query": query, "results": results}
+        payload = {"query": query, "results": results}
+        if applied:
+            payload["synonyms"] = applied
+        return payload
 
     def search_symbol(self, name: str, limit: int = 10) -> dict:
         name = (name or "").strip()
@@ -685,6 +735,255 @@ class QueryService:
             results.append(item)
         return {"query": query, "filters": {"class_name": class_name, "module": module},
                 "results": results}
+
+    # ------------------------------------------------------------------
+    # 页面导航 / 通知
+    # ------------------------------------------------------------------
+    def _find_class(self, name: str) -> sqlite3.Row | None:
+        row = self.conn.execute(
+            "SELECT * FROM classes WHERE class_name = ? COLLATE NOCASE", (name,)
+        ).fetchone()
+        if row is not None:
+            return row
+        return self.conn.execute(
+            "SELECT * FROM classes WHERE class_name LIKE ? COLLATE NOCASE "
+            "ORDER BY LENGTH(class_name) LIMIT 1",
+            (f"%{name}",),
+        ).fetchone()
+
+    def find_navigation(
+        self,
+        target: str,
+        depth: int = 6,
+        limit: int = 20,
+        include_weak: bool = True,
+    ) -> dict:
+        """从入口到目标页面的跳转链。
+
+        强边来自 ``navigation``（push/present/root/segue）；弱边来自
+        ``deps`` 的 ``instantiate``（tab 容器里 ``let vc = FooVC()`` 这类），
+        弱边标 ``confidence=low``，不会伪装成确定的跳转。
+        """
+        target = (target or "").strip()
+        depth = max(1, min(int(depth), 12))
+        limit = max(1, min(int(limit), 50))
+        empty = {
+            "target": target, "found": False, "reachable": False, "entrypoints": [],
+            "roots": [], "paths": [], "incoming": [], "outgoing": [],
+        }
+        if not target:
+            return empty
+        cls = self._find_class(target)
+        if cls is None:
+            return empty
+        name = cls["class_name"]
+
+        vc_names = {
+            row["class_name"]
+            for row in self.conn.execute(
+                "SELECT class_name FROM classes WHERE is_view_controller = 1"
+            )
+        }
+        entries = self.conn.execute(
+            "SELECT * FROM entrypoints WHERE class_name != ''"
+        ).fetchall()
+        entry_names = {row["class_name"] for row in entries}
+
+        edges: list[dict] = []
+        seen: set[tuple] = set()
+
+        def add_edge(
+            from_class: str, to_class: str, kind: str, identifier: str,
+            module: str, file_path: str, line: int, confidence: str,
+        ) -> None:
+            key = (from_class, to_class, kind, file_path, line)
+            if not from_class or not to_class or key in seen:
+                return
+            seen.add(key)
+            edges.append(
+                {
+                    "from_class": from_class, "to_class": to_class, "kind": kind,
+                    "identifier": identifier, "module": module,
+                    "file_path": file_path, "line_number": line,
+                    "confidence": confidence,
+                }
+            )
+
+        for row in self.conn.execute(
+            "SELECT from_class, to_class, kind, identifier, module, file_path, line_number "
+            "FROM navigation WHERE from_class != '' AND to_class != ''"
+        ):
+            add_edge(row["from_class"], row["to_class"], row["kind"], row["identifier"],
+                     row["module"], row["file_path"], row["line_number"], "high")
+
+        weak_edges = 0
+        if include_weak:
+            for row in self.conn.execute(
+                "SELECT from_class, dep_class, file_path, line_number FROM deps "
+                "WHERE dep_kind = 'instantiate'"
+            ):
+                dep = row["dep_class"]
+                if dep not in vc_names or dep == row["from_class"]:
+                    continue
+                if row["from_class"] not in vc_names and row["from_class"] not in entry_names:
+                    continue
+                add_edge(row["from_class"], dep, "instantiate", "", "", row["file_path"],
+                         row["line_number"], "low")
+
+            # 同一对 (from, to) 已有明确跳转时，不再重复记弱边
+            strong_pairs = {
+                (edge["from_class"], edge["to_class"])
+                for edge in edges if edge["confidence"] == "high"
+            }
+            edges = [
+                edge for edge in edges
+                if edge["confidence"] != "low"
+                or (edge["from_class"], edge["to_class"]) not in strong_pairs
+            ]
+            weak_edges = sum(1 for edge in edges if edge["confidence"] == "low")
+
+        incoming: dict[str, list[dict]] = {}
+        outgoing: dict[str, list[dict]] = {}
+        for edge in edges:
+            outgoing.setdefault(edge["from_class"], []).append(edge)
+            incoming.setdefault(edge["to_class"], []).append(edge)
+
+        paths: list[dict] = []
+        budget = {"n": 0}
+
+        def walk(node: str, chain: list[dict], visited: set[str]) -> None:
+            if budget["n"] > 4000 or len(paths) >= limit * 4:
+                return
+            budget["n"] += 1
+            if node in entry_names:
+                paths.append(
+                    {"root": node, "hops": len(chain), "chain": list(reversed(chain))}
+                )
+                return
+            if len(chain) >= depth:
+                return
+            for edge in incoming.get(node, []):
+                prev = edge["from_class"]
+                if prev in visited:
+                    continue
+                visited.add(prev)
+                chain.append(edge)
+                walk(prev, chain, visited)
+                chain.pop()
+                visited.discard(prev)
+
+        walk(name, [], {name})
+        paths.sort(key=lambda item: (item["hops"], item["root"]))
+
+        unique: list[dict] = []
+        seen_paths: set[tuple] = set()
+        for path in paths:
+            key = tuple(
+                (e["from_class"], e["to_class"], e["kind"], e["line_number"])
+                for e in path["chain"]
+            )
+            if key in seen_paths:
+                continue
+            seen_paths.add(key)
+            unique.append(path)
+            if len(unique) >= limit:
+                break
+
+        target_entries = [
+            {
+                "kind": row["kind"], "class_name": row["class_name"],
+                "identifier": row["identifier"], "source": row["source"],
+                "file_path": row["file_path"], "line_number": row["line_number"],
+            }
+            for row in entries
+            if row["class_name"] == name
+        ]
+
+        return {
+            "target": name,
+            "module": cls["module"],
+            "is_view_controller": bool(cls["is_view_controller"]),
+            "found": True,
+            "reachable": bool(unique),
+            "roots": sorted({path["root"] for path in unique}),
+            "entrypoints": target_entries,
+            "paths": unique,
+            "incoming": incoming.get(name, []),
+            "outgoing": outgoing.get(name, []),
+            "weak_edges": weak_edges,
+            "note": "" if unique else (
+                "未从已知入口连通：可能是 tab/容器创建页面的写法未被解析，"
+                "先看 incoming 里的直接来源"
+            ),
+        }
+
+    def find_notifications(
+        self, name: str = "", module: str = "", balanced: int | None = None,
+        limit: int = 100,
+    ) -> dict:
+        """通知注册/移除查询。``balanced``：0 未配对，1 已配对，-1 无法判定。"""
+        name = (name or "").strip()
+        limit = max(1, min(int(limit), 500))
+        filters: list[str] = []
+        params: list[Any] = []
+        if name:
+            pattern = like_pattern(name)
+            filters.append("(notification_name LIKE ? ESCAPE '\\' "
+                           "OR class_name LIKE ? ESCAPE '\\')")
+            params.extend([pattern, pattern])
+        if module:
+            filters.append("module = ?")
+            params.append(module)
+        if balanced is not None:
+            filters.append("is_balanced = ?")
+            params.append(int(balanced))
+        where = (" WHERE " + " AND ".join(filters)) if filters else ""
+
+        rows = self.conn.execute(
+            "SELECT * FROM notifications" + where
+            + " ORDER BY CASE is_balanced WHEN 0 THEN 0 WHEN -1 THEN 1 ELSE 2 END,"
+              " notification_name, class_name LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+
+        summary = {"total": 0, "balanced": 0, "unbalanced": 0, "unknown": 0}
+        for row in self.conn.execute(
+            "SELECT is_balanced, COUNT(*) AS n FROM notifications" + where
+            + " GROUP BY is_balanced",
+            params,
+        ):
+            count = int(row["n"])
+            summary["total"] += count
+            if row["is_balanced"] == 1:
+                summary["balanced"] = count
+            elif row["is_balanced"] == 0:
+                summary["unbalanced"] = count
+            else:
+                summary["unknown"] = count
+
+        results = [
+            {
+                "class_name": row["class_name"],
+                "notification_name": row["notification_name"],
+                "observer_selector": row["observer_selector"],
+                "register_method": row["register_method"],
+                "register_line": row["register_line"],
+                "remove_method": row["remove_method"],
+                "remove_line": row["remove_line"],
+                "is_balanced": row["is_balanced"],
+                "module": row["module"],
+                "language": row["language"],
+                "file_path": row["file_path"],
+                "line": row["register_line"],
+            }
+            for row in rows
+        ]
+        return {
+            "query": name,
+            "filter": {"module": module, "balanced": balanced},
+            "summary": summary,
+            "results": results,
+        }
 
     def list_pages(self, module: str = "", limit: int = 100) -> dict:
         limit = max(1, min(int(limit), 500))

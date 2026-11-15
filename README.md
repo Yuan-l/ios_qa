@@ -1,11 +1,11 @@
-# ios_qa — iOS 静态解析 + 知识库（P1）
+# ios_qa — iOS 静态解析 + 知识库（P1 / P2）
 
 纯 Python 词法扫描，把 iOS 工程解析成 SQLite 结构化索引，提供：
 
 - **结构化索引**：类/协议/扩展、方法体、依赖、调用边、页面入口、跳转、通知、API 端点
-- **中文全文检索**：CJK 单字 + bigram 预分词，不依赖 jieba
-- **查询 CLI**：8 个命令，输出带文件与行号
-- **MCP server**：12 个工具，可直接接 Claude Code / 其他 MCP 客户端
+- **中文全文检索**：CJK 单字 + bigram 预分词，不依赖 jieba；支持业务别名扩展
+- **查询 CLI**：功能检索、符号、调用、影响面、页面入口路径、通知配对
+- **MCP server**：14 个工具，可直接接任意支持 stdio 的 MCP 客户端
 
 查询层（`query.py`）不依赖 CLI / MCP，后续接 Agent Loom 只需换接入层。
 
@@ -25,7 +25,7 @@ python3 -m ios_qa build --check
 # 自检
 python3 -m ios_qa doctor
 
-# 模型无关的 golden 验收（14 个用例，不调用任何 LLM）
+# 模型无关的 golden 验收（20 个用例，不调用任何 LLM）
 python3 -m ios_qa eval
 
 # 查询
@@ -37,6 +37,8 @@ python3 -m ios_qa impact TBRequestManager --depth 2
 python3 -m ios_qa read components/TBNetworkManager/Classess/Objc/TBRequestManager.h --focus shared
 python3 -m ios_qa pages
 python3 -m ios_qa module TDMonitorKit
+python3 -m ios_qa path TBFinanceDetailViewController
+python3 -m ios_qa notifications --unbalanced
 ```
 
 索引默认落在 `ios_qa/.data/ios_qa.db`（已加入 `.gitignore`）。
@@ -68,6 +70,8 @@ python3 -m ios_qa module TDMonitorKit
 | `impact <目标>` | 反向 BFS 影响面，`--depth 1..4` |
 | `read <file>` | 带行号读源码，`--focus` 定位首次命中 |
 | `pages` | 列出 UIViewController 子类 |
+| `path <类>` | 从已知入口到该页面的跳转链；`--depth` / `--limit` / `--no-weak` |
+| `notifications [名称]` | 通知注册/移除配对；`--module` / `--unbalanced` / `--unknown` |
 | `module <名称>` | 模块概览 |
 | `qa save/search/delete` | 历史问答知识库 |
 | `mcp` | 启动 MCP stdio server |
@@ -85,6 +89,23 @@ TBRequestManager  (class/objc/TBNetworkManager)
   TBFinanceHTTP.attemptGETAtIndex:... -> shared
     [components/TBFinanceKit/TBFinanceKit/Classes/Network/TBFinanceHTTP.m:74]
 ```
+
+示例输出（`path`，`low` 表示低置信度的实例化边）：
+
+```
+TBFinanceDetailViewController  导航  (TBFinanceKit)
+
+  路径 1  (入口 AppDelegate / 2 跳)
+    AppDelegate --instantiate(low)--> TBFinanceHomeViewController
+      [TrueDepthDemo2/AppDelegate.swift:48]
+    TBFinanceHomeViewController --push--> TBFinanceDetailViewController
+      [components/TBFinanceKit/TBFinanceKit/Classes/UI/TBFinanceHomeViewController.m:793]
+```
+
+`path` 只做图上的连通性回溯，不猜类型：强边来自 `navigation`
+（push/present/root/segue），弱边来自 `deps` 的 `instantiate`
+（tab 容器里 `let vc = FooVC()` 这类写法），同一对类已有强边时丢弃弱边。
+没有连通路径时返回 `incoming` 直接来源，并说明未连通原因。
 
 ---
 
@@ -121,6 +142,8 @@ MCP 是协议，不绑定客户端：OpenCode、Cursor、Claude Code、自研 Ag
 | `impact_analysis` | 影响面分析 |
 | `read_source` | 读源码（带行号，支持 focus） |
 | `list_pages` | 页面列表 |
+| `find_navigation` | 入口 → 页面的跳转链（含低置信度实例化边） |
+| `find_notifications` | 通知注册/移除查询，`unbalanced_only` 只看未配对 |
 | `list_module` | 模块概览 |
 | `search_qa` | 检索历史问答 |
 | `save_qa` | 保存问答 |
@@ -139,6 +162,8 @@ ios_qa/
 ├── discover.py        源码发现、目录/文件过滤、sha256
 ├── source.py          注释/字符串屏蔽、括号配对、行号换算、URL 清洗
 ├── textnorm.py        CJK 单字+bigram、驼峰拆词、FTS 表达式
+├── synonyms.py        业务别名加载与查询扩展
+├── synonyms.json      业务别名分组（行情/报价、崩溃/crash …）
 ├── model.py           SymbolRec / MethodRec / DepRec / CallRec ...
 ├── parsers/
 │   ├── objc.py        .h/.m/.mm：interface/category/协议/方法体/通知/导航
@@ -172,6 +197,26 @@ FTS5 的 `unicode61` 会把连续中文当成一个 token，`MATCH '首页'` 对
 - 标识符：驼峰/下划线/数字边界拆词并小写（`TDURLSessionNetworkClient`
   → `td url session network client`）
 - 查询侧使用同一套分词，token 逐个加引号，避免 `and/or/not` 被当操作符
+
+### 业务同义词
+
+类名是英文（`TBFinanceQuote`、`TDANRFeature`），提问是中文口语（报价、卡顿），
+中间的映射写在 `synonyms.json`，按「组」维护，一组内的词互相扩展：
+
+```json
+[["行情", "报价", "quote"], ["崩溃", "crash"], ["卡顿", "掉帧", "jank"]]
+```
+
+- 每组最多扩展 `MAX_EXPANSIONS=8` 个词，避免一个词炸成几十路查询；
+- 只有**主查询最高分 < 55** 时才启用扩展。像「首页」这种字面就命中很强的查询，
+  扩展成 `home` 会灌进一堆 `QWeatherHome*` 视图，反而变差；
+- 扩展路径用与主查询相同的四路打分（类名 / FTS / 方法体 / 入口），整体减 2 分，
+  并在结果里标 `matched_on=*_synonym`、`synonym="报价→行情"`；
+- 返回体带 `synonyms` 字段，调用方能看出这次检索用了哪些别名。
+
+`find_feature` 的打分基线：类名精确 100 / 包含 60~80、FTS AND 50、FTS OR 44
+（部分命中不能和 AND 同分）、方法级 AND 35 / OR 30、入口 70、LIKE 兜底 30；
+VC +4、App 入口 +3。
 
 ---
 
@@ -219,16 +264,20 @@ python3 -m unittest discover -s ios_qa/tests -v
 
 覆盖：
 
-- 中文单字/bigram、驼峰拆词、FTS 表达式转义
+- 中文单字/bigram、驼峰拆词、FTS 表达式转义、业务别名扩展
 - ObjC 头文件/实现：符号、方法、调用、通知、行号
 - Swift：类型/属性/方法、调用、导航、通知、URL
 - Storyboard 入口与 segue
 - 增量构建幂等、文件修改/删除
 - 中文查询、Q&A 往返
-- MCP 工具集合与调用返回（12 个工具）
+- 页面入口链：强边（push/root）+ 弱边（instantiate）、未连通时的空结果
+- 通知配对：未配对检测、按名称反查
+- 同义词扩展：报价→行情（保留 Quote 字面命中）、jank→卡顿
+- MCP 工具集合与调用返回（14 个工具）
 - `build --check`：通过 / 失败退出码 3 / 无用例跳过 / 不加参数不跑 eval
-- 真实仓库 smoke：规模、`TBRequestManager.h:29`、`TBFinanceHTTP.m:74` 等已知行号
-- `run_eval()`：14 个 golden 用例全绿，且每条都带 `last_reviewed`
+- 真实仓库 smoke：规模、`TBRequestManager.h:29`、`TBFinanceHTTP.m:74`、
+  `AppDelegate.swift:48 → TBFinanceHomeViewController.m:793` 导航链
+- `run_eval()`：20 个 golden 用例全绿，且每条都带 `last_reviewed`
 
 ---
 
@@ -269,6 +318,25 @@ python3 -m ios_qa build --check
 | `reason` | **为什么要有这条用例**，写清它防的是哪类回归 |
 | `last_reviewed` | 上次人工确认的日期（`YYYY-MM-DD`），仅用于审计 |
 
+`checks[].kind` 支持的断言：
+
+| kind | 断言内容 |
+|---|---|
+| `class_in_results` / `min_results` | 结果类名包含 / 至少 N 条 |
+| `superclass_equals` | 首条结果的父类 |
+| `method_at_line` | 方法名 + 文件后缀 + 行号（`method_name` / `file_suffix` / `line`） |
+| `trace_found` | `trace` 找到目标 |
+| `file_line_present` | 某个列表字段里存在 `file_suffix` + `line` |
+| `api_url_contains` | API 端点的 `url_pattern` 含子串 |
+| `read_focus_matched` / `read_content_contains` | `read` 的 focus 命中 / 正文含子串 |
+| `field_gte` / `warnings_empty` | 任意数值字段阈值 / `info` 无警告 |
+| `level_class_present` | 影响面某一层包含指定类 |
+| `navigation_reachable` | 有从已知入口连通的路径 |
+| `navigation_edge` | 路径中出现指定边（`from` / `to` / `edge_kind` / `line` / `file_suffix`） |
+| `notification_contains` | 结果含指定 `class` + `name` 的通知 |
+| `summary_gte` | `summary` 某字段 ≥ 期望值 |
+| `synonyms_applied` | 本次检索应用了指定别名对（`from` / `to`） |
+
 ### 维护策略
 
 - 执行：事件驱动，每次 `build` 后 / 改解析器后 / CI 中跑，秒级成本；
@@ -299,17 +367,20 @@ eval 失败
 
 ---
 
-## P1 验收（本仓库实测）
+## 验收（本仓库实测）
 
 | 项目 | 结果 |
 |---|---|
-| 全量构建耗时 | 约 3~4s（361 文件 / 5.2 万行） |
+| 全量构建耗时 | 约 3~4s（364 文件 / 5.1 万行） |
 | 重复构建 | `files_parsed=0`，计数不变 |
 | 解析失败 | 0 |
-| 索引规模 | 347 类 / 2217 方法 / 4035 调用边 / 1029 依赖边 |
+| 索引规模 | 350 类 / 2250 方法 / 4069 调用边 / 1039 依赖边 / 47 导航边 / 21 通知 |
 | 关键词验证 | 中文 FTS 命中；头文件/实现/调用方行号与源码一致 |
-| `eval` golden 用例 | **14/14 通过**（不依赖任何模型） |
-| 测试 | 32 个 unittest 全部通过 |
+| 入口路径 | `path TBFinanceDetailViewController` 连通 AppDelegate（弱边）→ 行情首页 → 详情页（push@793） |
+| 通知配对 | 未配对 1 条：`CameraViewController.tbLanguageDidChange`（只注册不移除） |
+| 业务别名 | `报价` 同时命中 `TBFinanceQuote` 与行情页；`jank` → 卡顿 → `TDLongTaskMonitor` |
+| `eval` golden 用例 | **20/20 通过**（不依赖任何模型） |
+| 测试 | 42 个 unittest 全部通过 |
 
 手动抽查建议：
 
@@ -318,6 +389,8 @@ python3 -m ios_qa trace TBRequestManager
 python3 -m ios_qa trace TDMonitor
 python3 -m ios_qa find "性能 监控"
 python3 -m ios_qa impact TDMonitor --depth 2
+python3 -m ios_qa path TBFinanceDetailViewController
+python3 -m ios_qa notifications --unbalanced
 ```
 
 ---
@@ -328,6 +401,9 @@ python3 -m ios_qa impact TDMonitor --depth 2
   `confidence` 字段标注 `high/medium/low`；
 - Swift 属性支持显式类型与 `= Foo()` 推断，复杂表达式不展开；
 - 通知配对基于同名注册/移除，RAC / block 观察者标为 `-1`（无法判定）；
+- 页面入口只认 storyboard `initialViewController`、segue、`pushViewController` /
+  `present` 等明确写法；`tabBar.viewControllers?.append(...)` 这类容器创建页面
+  暂未解析，`path` 用 `instantiate` 弱边兜底；
 - 向量检索、相似代码、重复扫描（参考系统的 6 个工具）留到 P3；
 - 不解析 Objective-C++ 模板细节与宏展开。
 
@@ -341,5 +417,10 @@ python3 -m ios_qa impact TDMonitor --depth 2
 3. **Agent 层（可选）**：如果要用 LLM 评估自然语言答案，接任意 Agent 即可，
    评测脚本只消费 MCP 返回的 JSON，不依赖具体厂商。换模型只需要换客户端配置。
 
-- **P2**：补充更多 golden 用例（页面入口、通知配对、影响面），跑通任意 MCP 客户端接入；
+- **P2-a（已完成）**：补查询面 —— 页面入口路径（`path` / `find_navigation`）、
+  通知专项查询（`notifications` / `find_notifications`）、业务同义词
+  （`synonyms.json`），golden 扩到 20 条；
+- **P2-b**：解析质量 —— Swift extension / ObjC category 归属、block / 协议方法调用、
+  tab 容器创建页面的导航边；
+- **P2-c**：双 MCP 客户端接入验收（协议层 + 数据层）；
 - **P3**：向量层（`sqlite-vec` 或外部索引）+ 相似代码/重复扫描 + Agent Loom 接入。

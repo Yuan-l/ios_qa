@@ -38,7 +38,7 @@ OBJC = """\
 EXPECTED_TOOLS = {
     "kb_info", "find_feature", "search_symbol", "trace_class", "search_methods",
     "find_callers", "impact_analysis", "read_source", "list_pages",
-    "list_module", "search_qa", "save_qa",
+    "list_module", "search_qa", "save_qa", "find_navigation", "find_notifications",
 }
 
 
@@ -85,6 +85,24 @@ class McpTest(unittest.TestCase):
         output = asyncio.run(run())
         self.assertIn("reload", output)
         self.assertIn("content", output)
+
+    def test_call_find_navigation(self) -> None:
+        async def run() -> str:
+            result = await mcp_server.mcp.call_tool(
+                "find_navigation", {"target": "TBHomeViewController"}
+            )
+            return str(result)
+
+        output = asyncio.run(run())
+        self.assertIn("reachable", output)
+
+    def test_call_find_notifications(self) -> None:
+        async def run() -> str:
+            result = await mcp_server.mcp.call_tool("find_notifications", {})
+            return str(result)
+
+        output = asyncio.run(run())
+        self.assertIn("summary", output)
 
 
 if __name__ == "__main__":

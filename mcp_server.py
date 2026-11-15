@@ -120,6 +120,29 @@ def impact_analysis(target: str, depth: int = 2, limit: int = 200) -> str:
 
 
 @mcp.tool()
+def find_navigation(target: str, depth: int = 6, limit: int = 20) -> str:
+    """页面是从哪个入口、经过哪些跳转到达的（含低置信度的实例化边）。"""
+    with _service() as service:
+        return _dump(service.find_navigation(target, depth=depth, limit=limit))
+
+
+@mcp.tool()
+def find_notifications(
+    name: str = "", module: str = "", unbalanced_only: bool = False, limit: int = 100
+) -> str:
+    """通知注册/移除查询；unbalanced_only=true 只看注册后没有移除的。"""
+    with _service() as service:
+        return _dump(
+            service.find_notifications(
+                name=name,
+                module=module,
+                balanced=0 if unbalanced_only else None,
+                limit=limit,
+            )
+        )
+
+
+@mcp.tool()
 def read_source(file_path: str, focus: str = "", context: int = 40) -> str:
     """按行号读取源码；给 focus 时定位到首次命中附近。"""
     with _service() as service:

@@ -165,6 +165,54 @@ class RealRepoSmokeTest(unittest.TestCase):
             names = [r["class_name"] for r in result["results"]]
             self.assertIn("TBRequestManager", names)
 
+    def test_navigation_path(self) -> None:
+        with QueryService(self.profile, self.db_path) as service:
+            result = service.find_navigation("TBFinanceDetailViewController")
+            self.assertTrue(result["found"])
+            self.assertTrue(result["reachable"])
+            self.assertIn("AppDelegate", result["roots"])
+            hops = [
+                (hop["from_class"], hop["to_class"], hop["kind"], hop["line_number"])
+                for path in result["paths"]
+                for hop in path["chain"]
+            ]
+            self.assertIn(
+                ("AppDelegate", "TBFinanceHomeViewController", "instantiate", 48), hops
+            )
+            self.assertIn(
+                (
+                    "TBFinanceHomeViewController",
+                    "TBFinanceDetailViewController",
+                    "push",
+                    793,
+                ),
+                hops,
+            )
+
+    def test_navigation_missing_class(self) -> None:
+        with QueryService(self.profile, self.db_path) as service:
+            result = service.find_navigation("TBNoSuchViewController")
+            self.assertFalse(result["found"])
+            self.assertFalse(result["reachable"])
+
+    def test_notifications_unbalanced(self) -> None:
+        with QueryService(self.profile, self.db_path) as service:
+            result = service.find_notifications(balanced=0)
+            self.assertGreaterEqual(result["summary"]["unbalanced"], 1)
+            pairs = {
+                (row["class_name"], row["notification_name"])
+                for row in result["results"]
+            }
+            self.assertIn(("CameraViewController", "tbLanguageDidChange"), pairs)
+
+    def test_synonym_expansion(self) -> None:
+        with QueryService(self.profile, self.db_path) as service:
+            result = service.find_feature("报价", limit=10)
+            names = [item["class_name"] for item in result["results"]]
+            self.assertIn("TBFinanceHomeViewController", names)
+            pairs = {(item["from"], item["to"]) for item in result.get("synonyms", [])}
+            self.assertIn(("报价", "行情"), pairs)
+
     def test_doctor_metrics(self) -> None:
         with QueryService(self.profile, self.db_path) as service:
             info = service.info()

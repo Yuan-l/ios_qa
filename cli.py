@@ -13,6 +13,8 @@
     python3 -m ios_qa read <file> --focus foo
     python3 -m ios_qa pages
     python3 -m ios_qa module TDMonitorKit
+    python3 -m ios_qa path TBFinanceDetailViewController
+    python3 -m ios_qa notifications --unbalanced
     python3 -m ios_qa qa save "问题" "答案"
     python3 -m ios_qa qa search "问题"
     python3 -m ios_qa eval
@@ -393,6 +395,76 @@ def cmd_module(args) -> int:
     return 0
 
 
+def cmd_path(args) -> int:
+    with _service(args) as service:
+        data = service.find_navigation(
+            args.class_name,
+            depth=args.depth,
+            limit=args.limit,
+            include_weak=not args.no_weak,
+        )
+    if args.json:
+        _dump(data)
+        return 0 if data["found"] else 1
+    if not data["found"]:
+        print(f"没有找到类「{args.class_name}」。")
+        return 1
+    print(f"{data['target']}  导航  ({data['module']})")
+    if data["entrypoints"]:
+        for entry in data["entrypoints"]:
+            print(f"  入口: {entry['kind']} {entry['identifier']}  "
+                  f"[{entry['file_path']}:{entry['line_number']}]")
+    if not data["reachable"]:
+        print(f"  ⚠️  {data['note']}")
+    for index, path in enumerate(data["paths"], 1):
+        print(f"\n  路径 {index}  (入口 {path['root']} / {path['hops']} 跳)")
+        for hop in path["chain"]:
+            mark = "" if hop["confidence"] == "high" else f"({hop['confidence']})"
+            print(f"    {hop['from_class']} --{hop['kind']}{mark}--> {hop['to_class']}")
+            print(f"      [{hop['file_path']}:{hop['line_number']}]")
+    if data["incoming"]:
+        print("\n  直接来源:")
+        for edge in data["incoming"]:
+            mark = "" if edge["confidence"] == "high" else f" ({edge['confidence']})"
+            print(f"    {edge['from_class']}  ({edge['kind']}{mark})  "
+                  f"[{edge['file_path']}:{edge['line_number']}]")
+    if data["outgoing"]:
+        print("\n  去向:")
+        for edge in data["outgoing"]:
+            print(f"    {edge['to_class']}  ({edge['kind']})  "
+                  f"[{edge['file_path']}:{edge['line_number']}]")
+    return 0
+
+
+def cmd_notifications(args) -> int:
+    balanced = 0 if args.unbalanced else (-1 if args.unknown else None)
+    with _service(args) as service:
+        data = service.find_notifications(
+            name=args.name or "",
+            module=args.module or "",
+            balanced=balanced,
+            limit=args.limit,
+        )
+    if args.json:
+        _dump(data)
+        return 0
+    summary = data["summary"]
+    print(f"通知: 匹配 {len(data['results'])} 条 / 共 {summary['total']} 条"
+          f"（未配对 {summary['unbalanced']}，已配对 {summary['balanced']}，"
+          f"无法判定 {summary['unknown']}）")
+    for item in data["results"]:
+        flag = {0: "未配对", 1: "已配对", -1: "无法判定"}.get(item["is_balanced"], "?")
+        print(f"\n  [{flag}] {item['class_name']}  {item['notification_name']}")
+        print(f"    注册: {item['register_method'] or '-'}  "
+              f"[{item['file_path']}:{item['register_line']}]")
+        if item["remove_line"]:
+            print(f"    移除: {item['remove_method'] or '-'}  "
+                  f"[{item['file_path']}:{item['remove_line']}]")
+        else:
+            print("    移除: (没有找到同名移除)")
+    return 0
+
+
 def cmd_qa(args) -> int:
     with _service(args) as service:
         if args.qa_action == "save":
@@ -543,6 +615,22 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("module", parents=[common], help="模块概览")
     p.add_argument("module")
     p.set_defaults(func=cmd_module)
+
+    p = sub.add_parser("path", parents=[common], help="从入口到页面的跳转链")
+    p.add_argument("class_name")
+    p.add_argument("--depth", type=int, default=6)
+    p.add_argument("--limit", type=int, default=20)
+    p.add_argument("--no-weak", action="store_true",
+                   help="不用 instantiate 这类低置信度边")
+    p.set_defaults(func=cmd_path)
+
+    p = sub.add_parser("notifications", parents=[common], help="通知注册/移除查询")
+    p.add_argument("name", nargs="?", default="", help="通知名或类名（模糊匹配）")
+    p.add_argument("--module", default="")
+    p.add_argument("--unbalanced", action="store_true", help="只看未配对")
+    p.add_argument("--unknown", action="store_true", help="只看无法判定")
+    p.add_argument("--limit", type=int, default=100)
+    p.set_defaults(func=cmd_notifications)
 
     p = sub.add_parser("qa", parents=[common], help="历史问答")
     qa_sub = p.add_subparsers(dest="qa_action", required=True)

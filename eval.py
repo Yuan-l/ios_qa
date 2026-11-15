@@ -43,6 +43,20 @@ def _call(service: QueryService, case: dict) -> dict:
         return service.impact_analysis(
             args["target"], depth=args.get("depth", 2), limit=args.get("limit", 200)
         )
+    if kind == "find_navigation":
+        return service.find_navigation(
+            args["target"],
+            depth=args.get("depth", 6),
+            limit=args.get("limit", 20),
+            include_weak=args.get("include_weak", True),
+        )
+    if kind == "find_notifications":
+        return service.find_notifications(
+            name=args.get("name", ""),
+            module=args.get("module", ""),
+            balanced=args.get("balanced"),
+            limit=args.get("limit", 100),
+        )
     if kind == "read_source":
         return service.read_source(
             args["file_path"],
@@ -152,6 +166,56 @@ def _check(data: dict, spec: dict) -> tuple[bool, str]:
         ]
         ok = spec["value"] in names
         return ok, f"{spec['value']} in {names[:8]}"
+
+    if kind == "navigation_reachable":
+        ok = bool(data.get("reachable"))
+        return ok, f"reachable={ok}, roots={data.get('roots')}"
+
+    if kind == "navigation_edge":
+        for path in data.get("paths", []):
+            for hop in path.get("chain", []):
+                if hop.get("from_class") != spec["from"]:
+                    continue
+                if hop.get("to_class") != spec["to"]:
+                    continue
+                if "edge_kind" in spec and hop.get("kind") != spec["edge_kind"]:
+                    continue
+                if "line" in spec and int(hop.get("line_number", 0)) != int(spec["line"]):
+                    continue
+                if "file_suffix" in spec and not hop.get("file_path", "").endswith(
+                    spec["file_suffix"]
+                ):
+                    continue
+                return True, f"{spec['from']}->{spec['to']} found"
+        hops = [
+            f"{hop.get('from_class')}->{hop.get('to_class')}"
+            for path in data.get("paths", [])
+            for hop in path.get("chain", [])
+        ]
+        return False, f"missing {spec['from']}->{spec['to']}; got {hops[:6]}"
+
+    if kind == "notification_contains":
+        for row in data.get("results", []):
+            if (
+                row.get("class_name") == spec["class"]
+                and row.get("notification_name") == spec["name"]
+            ):
+                return True, f"{spec['class']}.{spec['name']}"
+        actual = [
+            f"{row.get('class_name')}.{row.get('notification_name')}"
+            for row in data.get("results", [])
+        ]
+        return False, f"missing {spec['class']}.{spec['name']}; got {actual[:6]}"
+
+    if kind == "summary_gte":
+        actual = (data.get("summary") or {}).get(spec["field"])
+        ok = actual is not None and actual >= spec["value"]
+        return ok, f"summary.{spec['field']}={actual} >= {spec['value']}"
+
+    if kind == "synonyms_applied":
+        pairs = {(item.get("from"), item.get("to")) for item in data.get("synonyms") or []}
+        ok = (spec["from"], spec["to"]) in pairs
+        return ok, f"synonyms={sorted(pairs)}"
 
     raise ValueError(f"未知断言: {kind}")
 

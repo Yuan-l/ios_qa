@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "description": "业务别名分组：同组内任一词命中查询时，用组内其他词做 FTS 扩展。参考方案的 route_synonyms.json 等价物。",
+  "groups": [
+    ["行情", "报价", "quote", "股票"],
+    ["崩溃", "crash"],
+    ["性能", "卡顿", "掉帧", "jank"],
+    ["网络", "请求", "http", "api"],
+    ["首页", "主页", "home"],
+    ["登录", "登陆", "login", "signin"],
+    ["相机", "摄像头", "camera"],
+    ["图片", "滤镜", "filter"],
+    ["多语言", "语言", "i18n", "language"],
+    ["路由", "跳转", "route", "router"],
+    ["监控", "埋点", "telemetry"],
+    ["相册", "album", "picker"],
+    ["通知", "notification"]
+  ]
+}
