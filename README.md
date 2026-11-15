@@ -28,6 +28,9 @@ python3 -m ios_qa doctor
 # 模型无关的 golden 验收（25 个用例，不调用任何 LLM）
 python3 -m ios_qa eval
 
+# MCP 双客户端验收（协议层 + 数据层，失败退出码 1）
+python3 -m ios_qa mcp-smoke
+
 # 查询
 python3 -m ios_qa find "网络 请求"
 python3 -m ios_qa trace TBRequestManager
@@ -75,6 +78,7 @@ python3 -m ios_qa notifications --unbalanced
 | `module <名称>` | 模块概览 |
 | `qa save/search/delete` | 历史问答知识库 |
 | `mcp` | 启动 MCP stdio server |
+| `mcp-smoke` | 双 MCP 客户端验收（协议层 + 数据层），`--client raw/sdk/both`、`--only` |
 | `eval` | 跑 `eval_cases.json` 的 golden 用例，断言类/文件/行号/接口路径 |
 | `doctor` | 索引自检 |
 
@@ -152,6 +156,51 @@ MCP 是协议，不绑定客户端：OpenCode、Cursor、Claude Code、自研 Ag
 
 先构建索引再启动 MCP；索引不存在时工具会返回空结果，不会崩溃。
 
+### MCP 验收（`mcp-smoke`）
+
+「任意 MCP 客户端拿到同一份数据」不能只靠手工点一次，所以用两个互相独立的
+客户端各跑一遍，再和查询层对齐：
+
+**协议层**：两个客户端都以真实子进程方式启动 `python3 -m ios_qa mcp`，走 stdio。
+
+| 客户端 | 实现 | 证明什么 |
+|---|---|---|
+| `raw-jsonrpc` | 纯 stdlib，手写 JSON-RPC 2.0 报文（换行分隔） | 服务端不绑定任何 SDK，协议本身就走得通 |
+| `python-sdk` | 官方 `mcp` SDK 的 `ClientSession` | 生态里的主流客户端能直接接入 |
+
+**数据层**：同一组参数分别经两个客户端调用，再与 `QueryService` 的直接调用
+结果逐字段比对，三方相等才算通过。`save_qa` 是写路径，只验工具存在与入参
+schema，不在真实索引里造数据。
+
+```bash
+python3 -m ios_qa mcp-smoke                 # 两个客户端 + 13 个只读工具
+python3 -m ios_qa mcp-smoke --client raw    # 只跑 stdlib 客户端
+python3 -m ios_qa mcp-smoke --only trace_class
+python3 -m ios_qa mcp-smoke --json          # CI 消费
+```
+
+退出码：`0` 通过 / `1` 协议或数据不一致 / `2` 索引不存在。
+
+```text
+MCP 验收：TrueDepthDemo2  (ios_qa/.data/ios_qa.db)
+
+协议层
+  ✅ raw-jsonrpc  14 个工具  服务端 ios_qa / 协议 2024-11-05
+  ✅ python-sdk  14 个工具  服务端 ios_qa / 协议 2025-11-25
+  工具集合一致: 是（14 个）
+
+数据层（客户端返回 vs QueryService 直接调用）
+  ✅ kb_info              与查询层逐字段一致
+  ✅ find_feature         与查询层逐字段一致
+  ...
+  ⏭  save_qa              写路径只验协议
+
+通过 13/13 个工具（失败 0）；协议层通过
+```
+
+验收参数不写死类名：`build_cases()` 从索引里取样（方法最多的类、页面、模块、
+源码文件、方法名），换一个工程可以直接跑。
+
 ---
 
 ## 架构
@@ -174,6 +223,7 @@ ios_qa/
 ├── query.py           查询服务（纯 Python API）
 ├── cli.py             argparse 入口
 ├── mcp_server.py      FastMCP 适配层
+├── mcp_smoke.py       MCP 双客户端验收（stdlib JSON-RPC + 官方 SDK）
 └── tests/             unittest
 ```
 
@@ -319,6 +369,8 @@ python3 -m unittest discover -s ios_qa/tests -v
 - 扩展/分类归属：`search_symbol("BreadCrumb")`、`trace` 的 `extension_category`
 - 多行类声明、头文件变更触发同目录实现重解析
 - MCP 工具集合与调用返回（14 个工具）
+- 双客户端验收：stdlib JSON-RPC 客户端、官方 SDK 客户端、`save_qa` 写路径往返、
+  `mcp-smoke` 退出码
 - `build --check`：通过 / 失败退出码 3 / 无用例跳过 / 不加参数不跑 eval
 - 真实仓库 smoke：规模、`TBRequestManager.h:29`、`TBFinanceHTTP.m:74`、
   `AppDelegate.swift:48 → TBFinanceHomeViewController.m:793` 导航链
@@ -428,7 +480,8 @@ eval 失败
 | 协议/block 调用 | `delegate?.captureOutput` → `CameraCaptureViewModelDelegate`；`onSelect` 4 处 block 调用 |
 | 分类归属 | `search_symbol("BreadCrumb")` 命中 `UIViewController` 等 5 个宿主类 |
 | `eval` golden 用例 | **25/25 通过**（不依赖任何模型） |
-| 测试 | 50 个 unittest 全部通过 |
+| MCP 双客户端验收 | `raw-jsonrpc` 与 `python-sdk` 各 14 个工具；13 个只读工具与查询层逐字段一致 |
+| 测试 | 57 个 unittest 全部通过 |
 
 手动抽查建议：
 
@@ -471,5 +524,6 @@ python3 -m ios_qa notifications --unbalanced
   （`synonyms.json`），golden 扩到 20 条；
 - **P2-b（已完成）**：解析质量 —— Swift extension / ObjC category 归属、block / 协议
   方法调用、tab 容器创建页面的导航边、多行类声明；golden 扩到 25 条；
-- **P2-c**：双 MCP 客户端接入验收（协议层 + 数据层）；
+- **P2-c（已完成）**：双 MCP 客户端接入验收（`mcp-smoke`：stdlib JSON-RPC +
+  官方 SDK，协议层 + 数据层三方比对）；
 - **P3**：向量层（`sqlite-vec` 或外部索引）+ 相似代码/重复扫描 + Agent Loom 接入。

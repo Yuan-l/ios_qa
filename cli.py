@@ -526,6 +526,50 @@ def cmd_eval(args) -> int:
     return 0 if report["failed"] == 0 else 1
 
 
+def cmd_mcp_smoke(args) -> int:
+    from .mcp_smoke import run_acceptance
+
+    profile = _profile(args)
+    db_path = Path(args.db) if args.db else profile.resolved_db_path
+    if not db_path.exists():
+        print(f"索引不存在: {db_path}\n先运行 python3 -m ios_qa build")
+        return 2
+    report = run_acceptance(profile, db_path, clients=args.client, only=args.only)
+    if args.json:
+        _dump(report)
+        return 0 if report["ok"] else 1
+
+    print(f"MCP 验收：{report['project']}  ({report['db_path']})\n")
+    print("协议层")
+    for client in report["clients"]:
+        print(f"  {'✅' if client['ok'] else '❌'} {client['name']}"
+              f"  {client['tool_count']} 个工具"
+              f"  服务端 {client['meta'].get('server', '-')}"
+              f" / 协议 {client['meta'].get('protocol', '-')}")
+        for check in client["checks"]:
+            if not check["ok"]:
+                print(f"     ❌ {check['name']}: {check['detail']}")
+    if not report["tools"]["agree"]:
+        print("  ❌ 两个客户端看到的工具集合不一致")
+    print(f"  工具集合一致: {'是' if report['tools']['agree'] else '否'}"
+          f"（{report['tools']['count']} 个）")
+
+    print("\n数据层（客户端返回 vs QueryService 直接调用）")
+    for item in report["data"]:
+        if item["skipped"]:
+            print(f"  ⏭  {item['tool']:<20} {item['detail']}")
+        else:
+            print(f"  {'✅' if item['ok'] else '❌'} {item['tool']:<20} "
+                  f"{item['detail'] or '与查询层逐字段一致'}")
+
+    summary = report["summary"]
+    verdict = "通过" if report["ok"] else "失败"
+    print(f"\n{verdict} {summary['passed']}/{summary['compared']} 个工具"
+          f"（失败 {summary['failed']}）；协议层"
+          f"{'通过' if summary['protocol_ok'] else '失败'}")
+    return 0 if report["ok"] else 1
+
+
 def cmd_doctor(args) -> int:
     profile = _profile(args)
     db_path = Path(args.db) if args.db else profile.resolved_db_path
@@ -664,6 +708,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cases", default=None, help="用例 JSON（默认 ios_qa/eval_cases.json）")
     p.add_argument("--only", default="", help="只跑指定 id，逗号分隔")
     p.set_defaults(func=cmd_eval)
+
+    p = sub.add_parser(
+        "mcp-smoke", parents=[common],
+        help="MCP 双客户端验收（协议层 + 数据层）",
+    )
+    p.add_argument(
+        "--client", choices=["both", "raw", "sdk"], default="both",
+        help="both=stdlib JSON-RPC + 官方 SDK（默认）",
+    )
+    p.add_argument("--only", default="", help="只验指定工具")
+    p.set_defaults(func=cmd_mcp_smoke)
 
     p = sub.add_parser("doctor", parents=[common], help="自检")
     p.set_defaults(func=cmd_doctor)
