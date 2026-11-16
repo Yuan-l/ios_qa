@@ -575,6 +575,11 @@ export HF_ENDPOINT=https://hf-mirror.com
 python3 -m ios_qa vectors
 ```
 
+注意别用 `HF_HUB_OFFLINE=1`：`fastembed` 的缓存检查会去找旧目录名
+（`fastembed_cache/Qwen3-Embedding-0.6B-Q`），即使模型已缓存也会报
+`Could not load model ... from any source`。模型已缓存时同样保留上面的
+镜像变量即可离线复用缓存。
+
 构建与查询：
 
 ```bash
