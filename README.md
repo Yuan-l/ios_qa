@@ -593,12 +593,16 @@ python3 -m ios_qa similar-snippet SomeSnippet.m --min-similarity 0.9
 
 ```text
 $ python3 -m ios_qa semantic "相机拍照后怎么保存图片"
-语义检索「相机拍照后怎么保存图片」  rrf  索引 1507 个方法
-1. 0.833  TBSuperResolutionViewController.saveTapped  [MyCameraModule]
-   components/MyCameraModule/ViewController/TBSuperResolutionViewController.swift:...
+语义检索「相机拍照后怎么保存图片」  rrf  索引 1522 个方法
+1. 0.833  TBSuperResolutionViewController.saveTapped  [TBImageEditorKit]
+   components/TBImageEditorKit/TBImageEditorKit/Classes/UI/TBSuperResolutionViewController.swift:289-310
+   guard let image = resultImage else { return } let loading = TBEditorHUD.show(in: view, text: "正在写入相册…")
 2. 0.667  MainCameraEditViewController.saveImageToTempDirectory  [MyCameraModule]
-   ...
+   components/MyCameraModule/Classes/EditModule/MainCameraEditViewController.swift:77-92
+   guard let data = image.jpegData(compressionQuality: 0.8) else { return nil } ...
 3. 0.533  ImageEditorViewController.image  [MyCameraModule]
+   components/MyCameraModule/ViewController/ImageEditorViewController.swift:259-265
+   if let error = error { print("保存失败: ...") } else { print("图片保存成功") }
 ```
 
 真实问答建议直接用混合检索：规则负责召回，Cross-Encoder 决定顺序。
@@ -620,7 +624,7 @@ python3 -m ios_qa hybrid "网络请求失败怎么重试" --no-rerank   # 只看
 - Qdrant 本地模式有目录锁：同一个 `qdrant_storage` 不能并发开两个 client，
   `QueryService.close()` 会按顺序关闭 store / 缓存 / SQLite。
 
-实测本工程：1961 个有方法体的方法 → 1507 个可向量化。Qwen3-INT8 全量
+实测本工程：1946 个有方法体的方法 → 1522 个可向量化。Qwen3-INT8 全量
 `vectors` 约 78 分钟（CPU，`EMBED_BATCH=32`，模型已缓存；这是首次建库的
 一次性成本），之后增量索引只重算变更文件，2~4 秒；同一进程内 embedding /
 reranker 只加载一次，命中缓存的语义查询 <1 秒。只想快速重建时用
@@ -806,20 +810,20 @@ eval 失败
 
 | 项目 | 结果 |
 |---|---|
-| 全量构建耗时 | 约 6s（364 文件 / 5.1 万行，含代码指纹） |
+| 全量构建耗时 | 约 6s（377 文件 / 5.2 万行，含代码指纹） |
 | 重复构建 | `files_parsed=0`，计数不变 |
 | 解析失败 | 0 |
-| 索引规模 | 352 类 / 2280 方法（1961 有方法体）/ 4154 调用边 / 1108 依赖边 / 64 导航边 / 21 通知 |
-| 代码指纹 | 1461 个方法（约 0.76 MB blob），全量 1.6s；`duplicates` 约 0.1s |
+| 索引规模 | 353 类 / 2279 方法（1946 有方法体）/ 4153 调用边 / 1111 依赖边 / 64 导航边 / 21 通知 |
+| 代码指纹 | 1460 个方法（约 0.76 MB blob），全量 1.6s；`duplicates` 约 0.1s |
 | 重复代码 | 21 组（精确 13 / 近似 8），含 5 个 Category 的 `swizzleMethod:withMethod:` |
 | 关键词验证 | 中文 FTS 命中；头文件/实现/调用方行号与源码一致 |
-| 入口路径 | `path TBFinanceDetailViewController`：AppDelegate --tab@59--> 行情首页 --push@838--> 详情页 |
+| 入口路径 | `path TBFinanceDetailViewController`：AppDelegate --tab@60--> 行情首页 --push@838--> 详情页 |
 | 通知配对 | 未配对 1 条：`CameraViewController.tbLanguageDidChange`（只注册不移除） |
 | 业务别名 | `报价` 经同义词命中行情页 `TBFinanceHomeViewController`（靠界面文案 `@"行情"`）；`jank` → 卡顿 → `TDLongTaskMonitor` |
 | 协议/block 调用 | `delegate?.captureOutput` → `CameraCaptureViewModelDelegate`；`onSelect` 4 处 block 调用 |
 | 分类归属 | `search_symbol("BreadCrumb")` 命中 `UIViewController` 等 5 个宿主类 |
 | 同名类消歧 | `trace TBTabbarViewController` 返回 2 个声明点，`--module` 切换后方法不串模块 |
-| 向量索引 | 1507 个方法（≥3 行且 ≥80 字符）；全量约 222s，增量约 2~4s |
+| 向量索引 | 1522 个方法（≥3 行且 ≥80 字符）；Qwen3 全量约 78 分钟（一次性），增量约 2~4s（大批文件移动时约 1 分钟） |
 | `eval` golden 用例 | **38/38 通过**（含 2 条语义 + 7 条真实问答；无向量时 29 通过 + 9 跳过） |
 | MCP 双客户端验收 | `raw-jsonrpc` 与 `python-sdk` 各 19 个工具；18 个只读工具与查询层逐字段一致 |
 | UI 文案检索 | `find_feature("行情")` 命中 `TBFinanceHomeViewController`；注释里的中文不进类级检索 |
