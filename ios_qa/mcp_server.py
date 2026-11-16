@@ -21,7 +21,8 @@ from .query import QueryService
 
 _INSTRUCTIONS = """\
 iOS 工程静态知识库。回答代码问题前优先用这里的工具定位，不要凭空猜测：
-- 找功能/页面：find_feature（支持中文描述）
+- 找功能/页面：find_feature（支持中文描述）；同时要语义补位时用
+  hybrid_find_feature（FTS + 向量，按类合并）
 - 查类结构/调用链/通知/API：trace_class
 - 查方法：search_methods；查谁调用：find_callers；评估改动影响：impact_analysis
 - 找复制粘贴：find_similar_code（单方法）/ find_duplicates（全仓库聚类）
@@ -76,6 +77,24 @@ def find_feature(query: str, limit: int = 10) -> str:
     """按功能描述找类/页面（支持中文，如「首页 数据」「网络 请求」）。"""
     with _service() as service:
         return _dump(service.find_feature(query, limit=limit))
+
+
+@mcp.tool()
+def hybrid_find_feature(
+    query: str, limit: int = 5, module: str = "", rerank: bool = True
+) -> str:
+    """FTS + 向量混合检索：精确词命中优先，语义相近的实现补位。
+
+    结果按类去重，``sources`` 标明来自 ``fts`` / ``vector``，
+    ``vector_method`` 给出该类下语义最接近的方法。默认用 Cross-Encoder
+    精排前 8 个候选；``rerank=False`` 只看规则排序。
+    """
+    with _service() as service:
+        return _dump(
+            service.hybrid_find_feature(
+                query, limit=limit, module=module, rerank=rerank
+            )
+        )
 
 
 @mcp.tool()
@@ -163,7 +182,7 @@ def find_similar_code(
 
     - ``mode=lexical``（默认）：词法指纹，改过变量名/注释的复制粘贴也能认出来；
       similarity 是归一化 token 的 shingle 集合 Jaccard。
-    - ``mode=semantic``：Qdrant 语义近邻（BGE-512 + BM42），返回余弦
+    - ``mode=semantic``：Qdrant 语义近邻（Qwen3-1024 + BM42），返回余弦
       similarity 与复用建议；可传 ``class_name`` + ``method_name`` 或
       ``target="Class.method"``。
     """

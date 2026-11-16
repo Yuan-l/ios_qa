@@ -48,6 +48,12 @@ def _call(service: QueryService, case: dict) -> dict:
         return service.info()
     if kind == "find_feature":
         return service.find_feature(args["query"], limit=args.get("limit", 10))
+    if kind == "hybrid_find_feature":
+        return service.hybrid_find_feature(
+            args["query"],
+            limit=args.get("limit", 5),
+            module=args.get("module", ""),
+        )
     if kind == "search_symbol":
         return service.search_symbol(args["name"], limit=args.get("limit", 10))
     if kind == "trace_class":
@@ -150,6 +156,22 @@ def _check(data: dict, spec: dict) -> tuple[bool, str]:
         names = _class_names(data)
         ok = spec["value"] in names
         return ok, f"{spec['value']} in {names[:8]}"
+
+    if kind == "feature_rank":
+        results = data.get("results") or []
+        max_rank = int(spec.get("max_rank", 1))
+        wanted = set(spec.get("values") or [spec.get("value")])
+        for index, row in enumerate(results[:max_rank], 1):
+            if row.get("class_name") in wanted:
+                return True, (
+                    f"{row.get('class_name')} rank={index} score={row.get('score')} "
+                    f"sources={row.get('sources')}"
+                )
+        seen = [
+            f"{row.get('class_name')}={row.get('score')}"
+            for row in results[:max_rank]
+        ]
+        return False, f"{sorted(wanted)} not in top {max_rank}: {seen}"
 
     if kind == "min_results":
         rows = (

@@ -1,32 +1,36 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""向量层：Embedding 模型 + SQLite 向量缓存。
+"""向量层：Embedding 模型配置 + SQLite 向量缓存。
 
-与参考方案对齐（``Ios-qa MCP Server完整技术分析.md`` / ``iOS向量库 && 飞书loom.md``）：
+模型按 :class:`EmbeddingProfile` 描述“模型 / 维度 / 文本模板”，默认 ``qwen3-0.6b``：
 
-- 稠密模型 ``BAAI/bge-small-zh-v1.5``（512 维），fastembed + ONNX Runtime，
-  Mac 上 fastembed 会优先用 CoreML provider；
-- 文本前缀：索引 ``search_document: 类:{class} 方法:{method}\\n{body[:2000]}``，
-  查询 ``search_query: {query}``，代码片段 ``search_document: {code}``；
-- 缓存 ``embedding_cache.db``：``key = MD5("{model}:{text}")``，
-  ``value = struct.pack("<512f", *vector)``，只对未命中的文本做推理；
-- 稀疏通道 ``Qdrant/bm42-all-minilm-l6-v2-attentions``（BM42），
-  与稠密向量一起写入 Qdrant，由 RRF 融合。
+- ``qwen3-0.6b``：``Qwen/Qwen3-Embedding-0.6B-Q``（INT8），1024 维；query 用
+  ``Instruct: {task}\\nQuery: {query}``，document 为裸文本（无前缀）；
+- ``bge-small-zh``：``BAAI/bge-small-zh-v1.5``，512 维；
+  ``search_document:`` / ``search_query:`` 前缀（参考实现用的模型）；
+- ``jina-code``：``jinaai/jina-embeddings-v2-base-code``，768 维，裸文本；
+  只覆盖英文 + 编程语言，中文 query 属于分布外，仅用于 A/B。
 
-模型是**可替换的运行时依赖**：没装 ``fastembed`` 时抛
-:class:`EmbeddingUnavailable`，构建向量索引会给出安装提示，不影响结构化索引。
+切换 profile 用环境变量 ``IOS_QA_EMBED_PROFILE``。缓存
+``embedding_cache.db`` 的 key 是 ``MD5("{model}:{text}")``，换模型自动失效；
+``build_meta.json`` 记录 model/dim，查询侧发现与当前模型不一致会要求重建，
+不读取旧维度的索引。
+
+稀疏通道 ``Qdrant/bm42-all-minilm-l6-v2-attentions``（BM42）与稠密向量一起写入
+Qdrant，由 RRF 融合。没装 ``fastembed`` 时抛 :class:`EmbeddingUnavailable`，
+构建向量索引会给出安装提示，不影响结构化索引。
 """
 
 from __future__ import annotations
 
 import hashlib
+import os
 import sqlite3
 import struct
 from dataclasses import dataclass
 from pathlib import Path
 
-EMBED_MODEL = "BAAI/bge-small-zh-v1.5"
-EMBED_DIM = 512
+DEFAULT_PROFILE = "qwen3-0.6b"
 SPARSE_MODEL = "Qdrant/bm42-all-minilm-l6-v2-attentions"
 
 BODY_LIMIT = 2000
@@ -34,7 +38,8 @@ MIN_BODY_CHARS = 80
 MIN_BODY_LINES = 3
 
 CACHE_BATCH = 500
-EMBED_BATCH = 256
+# 0.6B 模型按 256 条推理会把内存顶到 12 GB 并触发 swap，32 条稳定在 ~2 GB。
+EMBED_BATCH = 32
 
 INSTALL_HINT = (
     "向量层依赖未安装：python3 -m pip install qdrant-client fastembed\n"
@@ -47,20 +52,94 @@ class EmbeddingUnavailable(RuntimeError):
     """缺少向量依赖或模型无法加载。"""
 
 
+# 查询侧任务描述：Qwen3 要求 query 带一句任务说明，document 不带。
+QUERY_INSTRUCTION = (
+    "Given a natural-language question about an iOS app, retrieve the "
+    "Objective-C or Swift method whose implementation answers it"
+)
+
+
+@dataclass(frozen=True)
+class EmbeddingProfile:
+    """一个 embedding 模型的文本契约：维度 + 索引/查询/片段模板。"""
+
+    name: str
+    model: str
+    dim: int
+    document: str
+    query: str
+    snippet: str
+
+    def document_text(self, class_name: str, method_name: str, body: str) -> str:
+        return self.document.format(
+            class_name=class_name,
+            method_name=method_name,
+            body=(body or "")[:BODY_LIMIT],
+        )
+
+    def query_text(self, query: str) -> str:
+        return self.query.format(
+            query=(query or "").strip(), instruction=QUERY_INSTRUCTION
+        )
+
+    def snippet_text(self, code: str) -> str:
+        return self.snippet.format(code=(code or "")[:BODY_LIMIT])
+
+
+PROFILES: dict[str, EmbeddingProfile] = {
+    "qwen3-0.6b": EmbeddingProfile(
+        name="qwen3-0.6b",
+        model="Qwen/Qwen3-Embedding-0.6B-Q",
+        dim=1024,
+        document="类:{class_name} 方法:{method_name}\n{body}",
+        query="Instruct: {instruction}\nQuery: {query}",
+        snippet="{code}",
+    ),
+    "bge-small-zh": EmbeddingProfile(
+        name="bge-small-zh",
+        model="BAAI/bge-small-zh-v1.5",
+        dim=512,
+        document="search_document: 类:{class_name} 方法:{method_name}\n{body}",
+        query="search_query: {query}",
+        snippet="search_document: {code}",
+    ),
+    "jina-code": EmbeddingProfile(
+        name="jina-code",
+        model="jinaai/jina-embeddings-v2-base-code",
+        dim=768,
+        document="{class_name} {method_name}\n{body}",
+        query="{query}",
+        snippet="{code}",
+    ),
+}
+
+
+def get_profile(name: str | None = None) -> EmbeddingProfile:
+    """按名字/环境变量取 profile；未指定时用默认模型。"""
+    key = (name or os.environ.get("IOS_QA_EMBED_PROFILE") or DEFAULT_PROFILE).strip()
+    profile = PROFILES.get(key)
+    if profile is None:
+        available = ", ".join(sorted(PROFILES))
+        raise ValueError(f"未知的 embedding profile：{key}（可选：{available}）")
+    return profile
+
+
+ACTIVE_PROFILE = get_profile()
+EMBED_MODEL = ACTIVE_PROFILE.model
+EMBED_DIM = ACTIVE_PROFILE.dim
+
+
 def document_text(class_name: str, method_name: str, body: str) -> str:
     """索引侧文本：类/方法是精确词，必须进 embedding 输入。"""
-    return (
-        f"search_document: 类:{class_name} 方法:{method_name}\n"
-        f"{(body or '')[:BODY_LIMIT]}"
-    )
+    return ACTIVE_PROFILE.document_text(class_name, method_name, body)
 
 
 def query_text(query: str) -> str:
-    return f"search_query: {(query or '').strip()}"
+    return ACTIVE_PROFILE.query_text(query)
 
 
 def snippet_text(code: str) -> str:
-    return f"search_document: {(code or '')[:BODY_LIMIT]}"
+    return ACTIVE_PROFILE.snippet_text(code)
 
 
 def cache_key(model: str, text: str) -> str:
@@ -169,16 +248,19 @@ class EmbeddingCache:
 
 
 class DenseEmbedder:
-    """BGE-small-zh-v1.5，走 ``embedding_cache.db`` 缓存。"""
+    """稠密向量，模型/维度来自 :class:`EmbeddingProfile`，走 ``embedding_cache.db``。"""
 
     def __init__(
         self,
         cache: EmbeddingCache,
-        model: str = EMBED_MODEL,
+        profile: EmbeddingProfile | None = None,
+        model: str | None = None,
         model_cache_dir: str | Path | None = None,
     ) -> None:
         self.cache = cache
-        self.model = model
+        self.profile = profile or ACTIVE_PROFILE
+        self.model = model or self.profile.model
+        self.dim = self.profile.dim
         self.model_cache_dir = model_cache_dir
         self._model = None
 

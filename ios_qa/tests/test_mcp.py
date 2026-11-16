@@ -40,7 +40,8 @@ OBJC = """\
 """
 
 EXPECTED_TOOLS = {
-    "kb_info", "find_feature", "search_symbol", "trace_class", "search_methods",
+    "kb_info", "find_feature", "hybrid_find_feature", "search_symbol",
+    "trace_class", "search_methods",
     "find_callers", "impact_analysis", "read_source", "list_pages",
     "list_module", "search_qa", "save_qa", "find_navigation", "find_notifications",
     "find_similar_code", "find_duplicates", "vector_search",

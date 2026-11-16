@@ -10,8 +10,8 @@
 - **中文全文检索**：CJK 单字 + bigram 预分词，不依赖 jieba；支持业务别名扩展
 - **查询 CLI**：功能检索、符号、调用、影响面、页面入口路径、通知配对
 - **重复/相似代码**：词法指纹（改局部变量名也能认出复制粘贴），精确 + 近似重复聚类
-- **语义检索**：Qdrant 双通道（BGE-512 稠密 + BM42 稀疏，RRF 融合），自然语言找方法体
-- **MCP server**：18 个工具，可直接接任意支持 stdio 的 MCP 客户端
+- **语义检索**：Qdrant 双通道（Qwen3-1024 稠密 + BM42 稀疏，RRF 融合）+ Cross-Encoder 精排，自然语言找方法体
+- **MCP server**：19 个工具，可直接接任意支持 stdio 的 MCP 客户端
 
 查询层（`query.py`）不依赖 CLI / MCP，后续接 Agent Loom 只需换接入层。
 
@@ -73,7 +73,7 @@ python3 -m ios_qa notifications --unbalanced
 python3 -m ios_qa similar QWeatherBaseButton.initWithFrame:
 python3 -m ios_qa duplicates --min-lines 8
 
-# 语义层（可选：需要 qdrant-client + fastembed，首次会下载 BGE/BM42 模型）
+# 语义层（可选：需要 qdrant-client + fastembed，首次会下载 Qwen3/BM42/reranker 模型）
 python3 -m ios_qa vectors                     # 增量构建 Qdrant 向量索引
 python3 -m ios_qa semantic "行情页面怎么加载数据"
 python3 -m ios_qa similar TBAlphaView.setupLayout --mode semantic
@@ -223,7 +223,8 @@ MCP 是协议，不绑定客户端：OpenCode、Cursor、Claude Code、自研 Ag
 | 工具 | 说明 |
 |---|---|
 | `kb_info` | 索引健康信息 |
-| `find_feature` | 功能/页面检索（中文） |
+| `find_feature` | 功能/页面检索（中文，纯词法） |
+| `hybrid_find_feature` | FTS + 向量混合找功能，按类合并；默认 Cross-Encoder 精排 top-8 |
 | `search_symbol` | 类名/方法名符号检索 |
 | `trace_class` | 类数据流全量视图；同名类返回 `ambiguous`/`candidates`，可传 `module` 消歧 |
 | `search_methods` | 方法体全文检索；方法名精确/包含命中优先于「方法体里提到」 |
@@ -262,7 +263,7 @@ MCP 是协议，不绑定客户端：OpenCode、Cursor、Claude Code、自研 Ag
 schema，不在真实索引里造数据。
 
 ```bash
-python3 -m ios_qa mcp-smoke                 # 两个客户端 + 17 个只读工具
+python3 -m ios_qa mcp-smoke                 # 两个客户端 + 18 个只读工具
 python3 -m ios_qa mcp-smoke --client raw    # 只跑 stdlib 客户端
 python3 -m ios_qa mcp-smoke --only trace_class
 python3 -m ios_qa mcp-smoke --json          # CI 消费
@@ -274,9 +275,9 @@ python3 -m ios_qa mcp-smoke --json          # CI 消费
 MCP 验收：TrueDepthDemo2  (.ios_qa/ios_qa.db)
 
 协议层
-  ✅ raw-jsonrpc  18 个工具  服务端 ios_qa / 协议 2024-11-05
-  ✅ python-sdk  18 个工具  服务端 ios_qa / 协议 2025-11-25
-  工具集合一致: 是（18 个）
+  ✅ raw-jsonrpc  19 个工具  服务端 ios_qa / 协议 2024-11-05
+  ✅ python-sdk  19 个工具  服务端 ios_qa / 协议 2025-11-25
+  工具集合一致: 是（19 个）
 
 数据层（客户端返回 vs QueryService 直接调用）
   ✅ kb_info              与查询层逐字段一致
@@ -286,7 +287,7 @@ MCP 验收：TrueDepthDemo2  (.ios_qa/ios_qa.db)
   ...
   ⏭  save_qa              写路径只验协议
 
-通过 17/17 个工具（失败 0）；协议层通过
+通过 18/18 个工具（失败 0）；协议层通过
 ```
 
 验收参数不写死类名：`build_cases()` 从索引里取样（方法最多的类、页面、模块、
@@ -309,7 +310,7 @@ ios_qa/                包（pip 安装的模块）
 │   ├── swift.py       class/struct/enum/protocol/extension/actor
 │   └── ui.py          storyboard/xib：入口与 segue
 ├── fingerprint.py     代码指纹：token 归一化、MinHash、LSH 分带、Jaccard
-├── embedding.py       BGE-512 / BM42 provider + embedding_cache.db 缓存
+├── embedding.py       Qwen3-1024 / BM42 provider + embedding_cache.db 缓存
 ├── vector_store.py    Qdrant 本地模式：collection methods、dense/sparse/RRF
 ├── vector_build.py    向量索引构建：筛选、point_id、增量 file_hashes
 ├── db.py              DDL、增量写入、classes 聚合、指纹重建、FTS 重建
@@ -342,7 +343,7 @@ FTS5 虚表：
 `classes_fts`、`methods_fts`、`qa_fts`（全量重建，数据量级下成本可接受）
 
 语义索引（与数据库同在 `<工程>/.ios_qa/` 下，均 gitignored）：
-`qdrant_storage/`（collection `methods`，dense 512 维 + sparse BM42）、
+`qdrant_storage/`（collection `methods`，dense 1024 维 + sparse BM42）、
 `embedding_cache.db`（`cache` 稠密 / `sparse_cache` 稀疏）、
 `qdrant_storage/build_meta.json`、`qdrant_storage/file_hashes.json`
 
@@ -503,7 +504,7 @@ $ python3 -m ios_qa duplicates --min-lines 10 --limit 1
 不会命中，这是词法指纹的固有边界。语义相近（不要求结构一致）由 P3-b 的
 向量层负责。
 
-### 语义检索（P3-b：Qdrant + BGE / BM42）
+### 语义检索（Qdrant + Qwen3 / BM42 + Cross-Encoder）
 
 两套索引用途不同：
 
@@ -518,12 +519,14 @@ $ python3 -m ios_qa duplicates --min-lines 10 --limit 1
 
 | 文档要求 | 本实现 |
 |---|---|
-| 稠密模型 `BAAI/bge-small-zh-v1.5`，512 维 | 一致，`fastembed` + ONNX Runtime |
+| 稠密模型 `BAAI/bge-small-zh-v1.5`，512 维 | 默认改为 `Qwen/Qwen3-Embedding-0.6B-Q`（1024 维，INT8）；BGE-512 保留为 profile 用于对照，见下文「模型选型」 |
 | 稀疏 BM42（`Qdrant/bm42-all-minilm-l6-v2-attentions`） | 一致，与稠密向量同写一个 collection |
 | collection `methods`，dense 余弦 | 一致 |
 | Hybrid = dense + sparse，Qdrant 原生 RRF（k=60） | 一致，`Prefetch` + `Fusion.RRF` |
-| 索引文本 `search_document: 类:{class} 方法:{method}\n{body[:2000]}` | 一致 |
-| 查询文本 `search_query: {query}`；片段 `search_document: {code}` | 一致 |
+| `hybrid_find_feature`：FTS + 向量，按类去重 | 已实现（Tool 14）；FTS 分归一到 0-1，向量用 cosine × 0.8 |
+| Cross-Encoder 精排 | 新增：`BAAI/bge-reranker-v2-m3-int8` 对规则召回的候选重排 top-K |
+| 索引文本 `search_document: 类:{class} 方法:{method}\n{body[:2000]}` | Qwen profile 改为裸文本 `类:{class} 方法:{method}\n{body}`；BGE profile 保留原前缀 |
+| 查询文本 `search_query: {query}`；片段 `search_document: {code}` | Qwen profile 用 `Instruct: {task}\nQuery: {query}`，片段裸代码；BGE profile 保留原前缀 |
 | `point_id = MD5(file_path:method_name)[:16]` | 一致，upsert 天然幂等 |
 | payload：class/method/module/language/file/line/body_preview | 一致 |
 | 跳过 <3 行或 <80 字符的方法 | 一致 |
@@ -533,10 +536,36 @@ $ python3 -m ios_qa duplicates --min-lines 10 --limit 1
 | Qdrant server | 用 `QdrantClient(path=...)` 本地持久化，API 语义一致；换 server 只改构造参数 |
 
 文档内部有一处冲突：总览写 `jina-embeddings-v2-base-code`（768 维），
-MCP 技术分析写 BGE-512。这里取更具体的 BGE-512；维度在 `build_meta.json`
-里，换模型会触发全量重建。
+MCP 技术分析写 BGE-512。我们没有在这两个里二选一，而是把模型/维度/文本模板
+做成 `EmbeddingProfile`，用 `IOS_QA_EMBED_PROFILE` 切换：
 
-安装依赖（首次运行会下载约 100 MB 模型）：
+| profile | 模型 | 维度 | 用途 |
+|---|---|---|---|
+| `qwen3-0.6b`（默认） | `Qwen/Qwen3-Embedding-0.6B-Q`（INT8） | 1024 | 中文 + 代码 + 100+ 语言，语义召回余量大 |
+| `bge-small-zh` | `BAAI/bge-small-zh-v1.5` | 512 | 参考实现同款；重建 3 秒，适合快速对照 |
+| `jina-code` | `jinaai/jina-embeddings-v2-base-code` | 768 | 只覆盖英文 + 30 种编程语言，中文 query 属分布外，仅作对照 |
+
+为什么默认 Qwen3：
+
+- `jina-code` 的模型卡明确写的是 English + 30 programming languages，不含中文；
+  而且已被 `jina-code-embeddings-0.5b/1.5b` 取代，不适合作为中文问答的默认模型。
+- `BAAI/bge-m3`（1024 维、100+ 语言、中文 RAG 强）在 `fastembed 0.9.1` 里
+  **没有 dense 实现**，要用得自己接 ONNX，暂不采用。
+- `Qwen3-Embedding-0.6B` 覆盖 100+ 语言并包含代码语料，query 用
+  `Instruct: {task}\nQuery: {query}`、document 裸文本；`fastembed 0.9.1` 直接支持。
+  INT8 版约 1.1 GB，CPU 上比 fp32 快一个数量级（fp32 跑第一个 256 batch
+  超过 40 分钟，不可用）。
+
+实测（同一套混合检索 + Cross-Encoder，7 条真实问题）：Qwen3 与 BGE 都是
+7/7 命中 top-3；BGE 在网络重试、城市搜索、日志上传上排得更高，Qwen3 的
+优势是语义召回余量（问题里没有代码字面量时更稳）。默认选 Qwen3，
+`IOS_QA_EMBED_PROFILE=bge-small-zh` 可以随时切回快速重建。
+
+维度记录在 `build_meta.json` 里：换 profile 后 `_vector_status` 会发现
+model/dim 不一致并提示重新运行 `vectors`，不会拿旧维度的索引硬查。
+
+安装依赖（首次运行会下载约 1.1 GB 的 INT8 embedding 模型；精排另需
+约 0.6 GB 的 reranker）：
 
 ```bash
 python3 -m pip install qdrant-client fastembed
@@ -562,8 +591,16 @@ $ python3 -m ios_qa semantic "相机拍照后怎么保存图片"
 语义检索「相机拍照后怎么保存图片」  rrf  索引 1507 个方法
 1. 0.833  TBSuperResolutionViewController.saveTapped  [MyCameraModule]
    components/MyCameraModule/ViewController/TBSuperResolutionViewController.swift:...
-2. 0.625  MainCameraEditViewController.saveImageToTempDirectory  [MyCameraModule]
+2. 0.667  MainCameraEditViewController.saveImageToTempDirectory  [MyCameraModule]
    ...
+3. 0.533  ImageEditorViewController.image  [MyCameraModule]
+```
+
+真实问答建议直接用混合检索：规则负责召回，Cross-Encoder 决定顺序。
+
+```bash
+python3 -m ios_qa hybrid "相机拍照后怎么保存图片"
+python3 -m ios_qa hybrid "网络请求失败怎么重试" --no-rerank   # 只看规则排序
 ```
 
 实现要点：
@@ -578,10 +615,15 @@ $ python3 -m ios_qa semantic "相机拍照后怎么保存图片"
 - Qdrant 本地模式有目录锁：同一个 `qdrant_storage` 不能并发开两个 client，
   `QueryService.close()` 会按顺序关闭 store / 缓存 / SQLite。
 
-实测本工程：1961 个有方法体的方法 → 1507 个可向量化；`vectors --full`
-222.5s（首次含模型加载），增量 2~4s（0~41 个 point）；语义查询约 0.3~1s。
-已知限制：BGE-small-zh 是通用中文小模型，中文 query → ObjC 方法体的召回
-不总是精确，类名/方法名明确时仍应优先用 `find_feature` / `search_methods`。
+实测本工程：1961 个有方法体的方法 → 1507 个可向量化。Qwen3-INT8 全量
+`vectors` 约 78 分钟（CPU，`EMBED_BATCH=32`，模型已缓存；这是首次建库的
+一次性成本），之后增量索引只重算变更文件，2~4 秒；同一进程内 embedding /
+reranker 只加载一次，命中缓存的语义查询 <1 秒。只想快速重建时用
+`IOS_QA_EMBED_PROFILE=bge-small-zh`，全量约 3 秒。
+
+已知限制：Qwen3-0.6B 是通用多语言模型，不是代码专用模型；中文 query →
+ObjC/Swift 方法体的排序靠「FTS 召回 + Cross-Encoder」兜底，类名/方法名
+明确时仍应优先用 `find_feature` / `search_methods`。
 
 ---
 
@@ -650,13 +692,13 @@ python3 -m unittest discover -s /path/to/ios_qa/ios_qa/tests -t /path/to/ios_qa 
 - 多行类声明、头文件变更触发同目录实现重解析
 - 代码指纹：token 归一化（含 ObjC `@"..."`）、短方法过滤、精确/近似重复聚类
 - 向量层：文本前缀、缓存读写、Qdrant 构建/增量/删除、dense/sparse/RRF 查询
-- MCP 工具集合与调用返回（18 个工具）
+- MCP 工具集合与调用返回（19 个工具）
 - 双客户端验收：stdlib JSON-RPC 客户端、官方 SDK 客户端、`save_qa` 写路径往返、
   `mcp-smoke` 退出码
 - `build --check`：通过 / 失败退出码 3 / 无用例跳过 / 不加参数不跑 eval
 - 真实仓库 smoke：规模、`TBRequestManager.h:29`、`TBFinanceHTTP.m:74`、
   入口链存在性（具体行号由 golden 负责，源码每次改动都会挪行）
-- `run_eval()`：31 个 golden 用例全绿，且每条都带 `last_reviewed`
+- `run_eval()`：38 个 golden 用例全绿，且每条都带 `last_reviewed`
 
 ---
 
@@ -773,8 +815,8 @@ eval 失败
 | 分类归属 | `search_symbol("BreadCrumb")` 命中 `UIViewController` 等 5 个宿主类 |
 | 同名类消歧 | `trace TBTabbarViewController` 返回 2 个声明点，`--module` 切换后方法不串模块 |
 | 向量索引 | 1507 个方法（≥3 行且 ≥80 字符）；全量约 222s，增量约 2~4s |
-| `eval` golden 用例 | **31/31 通过**（含 2 条语义用例；无向量时 29 通过 + 2 跳过） |
-| MCP 双客户端验收 | `raw-jsonrpc` 与 `python-sdk` 各 18 个工具；17 个只读工具与查询层逐字段一致 |
+| `eval` golden 用例 | **38/38 通过**（含 2 条语义 + 7 条真实问答；无向量时 29 通过 + 9 跳过） |
+| MCP 双客户端验收 | `raw-jsonrpc` 与 `python-sdk` 各 19 个工具；18 个只读工具与查询层逐字段一致 |
 | UI 文案检索 | `find_feature("行情")` 命中 `TBFinanceHomeViewController`；注释里的中文不进类级检索 |
 | 测试 | 99 个 unittest 全部通过（真模型不参与单测，用假 embedder 验链路） |
 
@@ -790,12 +832,18 @@ MCP SDK 真实拉起 `python3 -m ios_qa mcp` 子进程，按开发者口吻连�
 | 启动后怎么进入行情详情页？ | ✅ `AppDelegate --tab--> TBFinanceHomeViewController`(AppDelegate.swift:59) `--push--> TBFinanceDetailViewController`(.m:838) |
 | 有哪些重复代码？ | ✅ 21 组（精确 13 / 近似 8），能列出 `ImageEditorViewController` 的近似方法簇 |
 | 行情页数据从哪来？ | ⚠️ 结构化链路通，但 `trace_class` 的 `callers` 里混入 `NSCalendar` 等系统类，需要在结果里筛 `own_class` |
-| 相机拍照后怎么保存图片？ | ⚠️ `vector_search` top1 是 `TBSuperResolutionViewController.saveTapped`（按钮点击），真正的 `saveImageToTempDirectory` 排第二 |
-| 行情页面怎么加载数据？ | ⚠️ hybrid 分数 `QWeatherHomeViewController.updateErrorHint` 与 `TBFinanceHomeViewController.loadQuotesForCategory:` 同为 0.500，排序没有业务优先级 |
-| 离屏渲染卡顿怎么监控？ | ❌ 命中相机 Metal 渲染类；代码里没有“离屏渲染”字面量，`TDScreenRenderReport` 需要同义词才能捞到 |
+| 相机拍照后怎么保存图片？ | ✅ `hybrid_find_feature` #1 `MainCameraEditViewController.saveImageToTempDirectory` |
+| 行情页面怎么加载数据？ | ✅ #1 `TBFinanceHomeViewController.loadQuotesForCategory:` |
+| 网络请求失败怎么重试？ | ✅ `TBFinanceHTTP.attemptGETAtIndex:...` 进 top-3；#1 是 `TBNetworkFacadeSmokeViewController.requestFailure`（演示页） |
+| 怎么监控主线程卡顿？ | ✅ #1 `TDHangWatchdog.loop` |
+| 崩溃日志怎么上报？ | ✅ #1 `TBCrashReporter`（handleException / writeReportFile） |
+| 天气页面怎么搜索城市？ | ✅ `QWeatherSearchViewController.searchRemoteWithKeyword:` 进 top-3；#1 是首页定位数据 |
+| 日志怎么分批上传？ | ✅ `TBLogUploader` #2；#1 是 `MMAPFileManagerObjc.moveLogsToUploading:`（文件搬运） |
 
-结论：**结构化链路（impact / navigation / duplicates / read_source）可以直接用于问答；
-自然语言检索（vector / find_feature）还需要一轮同义词与重排**，见「已知边界」。
+结论：**结构化链路（impact / navigation / duplicates / read_source）可以直接
+用于问答；自然语言检索现在走 `hybrid_find_feature`（FTS + 向量 + Cross-Encoder），
+7 条真实问题全部命中 top-3**。剩下的问题是「问题里完全没有代码字面量」时
+仍需要同义词/查询改写，以及精排偶尔会把演示页排在实现前（网络重试）。
 
 手动抽查建议：
 
@@ -823,16 +871,20 @@ python3 -m ios_qa notifications --unbalanced
 - 同名类在 `classes` 里仍是一行（`method_count` 是合并值），
   `trace --module` 只收敛查询结果，不改写聚合表；
 - 重复/相似代码默认用**词法指纹**判定结构一致（改名能命中，换实现思路不命中）；
-  语义近邻需要先 `vectors`，且受 BGE-small-zh 的模型能力限制；
-- 语义检索的 `score` 在 hybrid 模式下是 RRF 融合分（约 0.2~0.9），不是余弦相似度；
-  需要余弦时可看 `find_similar_code --mode semantic` 的 dense 分支；
-- **自然语言检索质量**（真实会话实测）：中文 query → ObjC 方法体的排序不稳定，
-  top1 可能是同类里的按钮回调而不是真正做事的方法；同分时没有业务优先级。
-  命中的类/方法名明确时优先用 `find_feature` / `search_methods` / `trace_class`，
-  把 `vector_search` 当召回补充；
+  语义近邻需要先 `vectors`；默认 Qwen3-INT8 全量建库约 78 分钟（一次性），
+  快速对照可切 `bge-small-zh`；
+- `vector_search` 的 `score` 是 RRF 融合分（约 0.2~0.9）；`hybrid_find_feature`
+  的 `score` 是 Cross-Encoder 概率，`rule_score` / `vector_score` 保留规则分；
+  需要纯余弦看 `find_similar_code --mode semantic`；
+- **自然语言检索质量**：`hybrid_find_feature` 在 7 条真实问题上 7/7 命中 top-3，
+  但精排偶尔把演示页排在实现前（「网络失败重试」#1 是 Smoke VC，#3 才是
+  `TBFinanceHTTP`）；候选召回仍依赖问题里的字面量，完全同义改写会漏。
+  命中的类/方法名明确时优先用 `find_feature` / `search_methods` / `trace_class`；
 - **同义词覆盖不足**：代码里没有“离屏渲染”“失败重试”这类字面量时，
   纯关键词会命中相近词的类（相机 Metal 渲染）。需要往 `.ios_qa/synonyms.json`
-  补业务组，后续再加一层基于调用图的轻量重排；
+  补业务组；P1 计划把同义词写进索引文本，而不是只做查询侧扩展；
+- Cross-Encoder 首次使用要下载约 0.6 GB 模型，候选 20~45 个时单次精排约数秒；
+  不需要时传 `rerank=False` 只走规则排序；
 - 不解析 Objective-C++ 模板细节与宏展开。
 
 ## 后续
@@ -858,8 +910,12 @@ python3 -m ios_qa notifications --unbalanced
 - **P3-a（已完成）**：相似代码 / 重复扫描 —— `code_fingerprints` 表、MinHash + LSH
   出候选、shingle 集合精确复核；`similar` / `duplicates` / `find_similar_code` /
   `find_duplicates`；golden 扩到 29 条；
-- **P3-b（已完成）**：向量语义检索 —— Qdrant `methods` collection（BGE-512 +
+- **P3-b（已完成）**：向量语义检索 —— Qdrant `methods` collection（Qwen3-1024 +
   BM42，RRF k=60）、`embedding_cache.db`、`file_hashes.json` 增量；
   `vectors` / `semantic` / `similar-snippet`、`vector_search` /
-  `search_similar_snippet`、`find_similar_code(mode=semantic)`；golden 扩到 31 条；
-- **下一步**：Agent Loom 接入（MCP 已是稳定协议层，不绑定模型）。
+  `search_similar_snippet`、`find_similar_code(mode=semantic)`；
+- **P0（检索质量，已完成）**：模型 profile（默认 Qwen3-INT8，BGE/jina 可切）；
+  `hybrid_find_feature`（FTS + cosine×0.8，按类合并）；Cross-Encoder
+  `bge-reranker-v2-m3-int8` 精排；7 条真实问答 golden（top-3 断言）；golden 扩到 38 条；
+- **下一步**：索引期同义词标签、注释入 embedding、Agent Loom 接入（MCP 已是
+  稳定协议层，不绑定模型）。

@@ -181,6 +181,36 @@ def cmd_info(args) -> int:
     return 0
 
 
+def cmd_hybrid(args) -> int:
+    with _service(args) as service:
+        data = service.hybrid_find_feature(
+            args.query,
+            limit=args.limit,
+            module=args.module,
+            rerank=not args.no_rerank,
+        )
+    if args.json:
+        _dump(data)
+        return 0
+    for i, item in enumerate(data["results"], 1):
+        print(
+            f"\n{i}. {item['class_name']}  [{item['module']}]  "
+            f"score={item['score']}  sources={','.join(item['sources'])}"
+        )
+        print(f"   文件: {item['file_path']}")
+        method = item.get("vector_method") or {}
+        if method.get("method_name"):
+            print(f"   语义最相近: {method['method_name']} ({method['score']})")
+        methods = [m.get("method_name", "") for m in item.get("methods") or []][:5]
+        if methods:
+            print(f"   方法: {', '.join(methods)}")
+    if not data["results"]:
+        print(f"没有找到与「{args.query}」相关的功能。")
+    elif not data.get("vector_available"):
+        print(f"\n提示: {data.get('hint')}")
+    return 0
+
+
 def cmd_find(args) -> int:
     with _service(args) as service:
         data = service.find_feature(args.query, limit=args.limit)
@@ -843,6 +873,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("query")
     p.add_argument("--limit", type=int, default=10)
     p.set_defaults(func=cmd_find)
+
+    p = sub.add_parser("hybrid", parents=[common], help="FTS + 向量混合找功能")
+    p.add_argument("query")
+    p.add_argument("--limit", type=int, default=5)
+    p.add_argument("--module", default="")
+    p.add_argument("--no-rerank", action="store_true", help="只做规则排序，不加载 Cross-Encoder")
+    p.set_defaults(func=cmd_hybrid)
 
     p = sub.add_parser("symbol", parents=[common], help="查类/方法签名")
     p.add_argument("name")

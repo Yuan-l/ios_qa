@@ -17,6 +17,7 @@ from typing import Any, Iterable
 from .config import ProjectProfile
 from .db import connect, counts, get_metadata
 from .embedding import (
+    EMBED_DIM,
     EMBED_MODEL,
     DenseEmbedder,
     EmbeddingCache,
@@ -26,9 +27,18 @@ from .embedding import (
     snippet_text,
 )
 from .fingerprint import band_keys, decode_shingles, jaccard
+from .rerank import (
+    RERANK_CANDIDATES,
+    VECTOR_RERANK_TOP,
+    CrossEncoderReranker,
+    RerankUnavailable,
+)
 from .synonyms import expand_query, load_groups
 from .textnorm import build_search_text, fts_expr, like_pattern, snippet
-from .vector_build import read_meta, vector_dir
+from .vector_build import HASH_FILE, read_meta, vector_dir
+
+# 混合检索里向量的权重：文档 Tool 14 用 0.8，让 FTS 精确命中优先。
+VECTOR_WEIGHT = 0.8
 
 
 def _json_list(raw: str | None) -> list:
@@ -131,6 +141,9 @@ class QueryService:
         self.synonym_groups = load_groups(profile)
         self._vector_store = None
         self._embedding_cache = None
+        self._dense_embedder = None
+        self._sparse_embedder = None
+        self._reranker = None
 
     def close(self) -> None:
         if self._vector_store is not None:
@@ -423,6 +436,185 @@ class QueryService:
         if applied:
             payload["synonyms"] = applied
         return payload
+
+    def hybrid_find_feature(
+        self,
+        query: str,
+        limit: int = 5,
+        module: str = "",
+        rerank: bool = True,
+    ) -> dict:
+        """FTS + 向量混合找功能（参考文档 Tool 14），可选 Cross-Encoder 精排。
+
+        FTS 分数归一到 0-1，向量分数 ``cosine * 0.8``（让精确匹配优先），
+        按类去重取最高分。与文档的差别只在 FTS 侧：文档写「每条 1.0」，
+        这里保留 FTS 的强弱（``score / 100``），否则弱 OR 命中会和精确命中
+        同分，把语义结果挤出榜单。
+
+        ``rerank=True`` 时对规则召回的前 20 个候选做 Cross-Encoder 精排：
+        top-K 的顺序由 reranker 决定，规则分保留在 ``rule_score``；模型不可用时
+        静默回退到规则排序。
+        """
+        query = (query or "").strip()
+        limit = max(1, min(int(limit), 50))
+        base = {"query": query, "module": module, "results": []}
+        if not query:
+            return {**base, "available": False, "hint": "query 不能为空"}
+
+        merged: dict[str, dict] = {}
+
+        def slot(class_name: str) -> dict:
+            return merged.setdefault(
+                class_name,
+                {
+                    "class_name": class_name,
+                    "module": "",
+                    "file_path": "",
+                    "is_view_controller": False,
+                    "fts_score": 0.0,
+                    "vector_score": 0.0,
+                    "sources": [],
+                    "methods": [],
+                    "vector_method": None,
+                    "_rank": 1 << 30,
+                },
+            )
+
+        for rank, item in enumerate(
+            self.find_feature(query, limit=limit * 3)["results"]
+        ):
+            if module and item.get("module") != module:
+                continue
+            row = slot(item["class_name"])
+            row["module"] = row["module"] or item.get("module", "")
+            row["file_path"] = row["file_path"] or item.get("file_path", "")
+            row["is_view_controller"] = bool(
+                row["is_view_controller"] or item.get("is_view_controller")
+            )
+            row["fts_score"] = max(
+                row["fts_score"], min(1.0, float(item.get("score") or 0.0) / 100)
+            )
+            row["methods"] = row["methods"] or item.get("methods") or []
+            row["_rank"] = min(row["_rank"], rank)
+            if "fts" not in row["sources"]:
+                row["sources"].append("fts")
+
+        available, hint = self._vector_status()
+        vector_hits: list[dict] = []
+        if available:
+            try:
+                dense = self._dense().embed_query(query_text(query))
+                vector_hits = self._vectors().search_dense(dense, limit * 8, module)
+            except EmbeddingUnavailable as exc:
+                available, hint = False, str(exc)
+
+        for hit in vector_hits:
+            score = float(hit.get("score") or 0.0) * VECTOR_WEIGHT
+            row = slot(hit["class_name"])
+            row["module"] = row["module"] or hit.get("module", "")
+            row["file_path"] = row["file_path"] or hit.get("file_path", "")
+            row["vector_score"] = max(row["vector_score"], score)
+            if "vector" not in row["sources"]:
+                row["sources"].append("vector")
+            best = row["vector_method"]
+            if best is None or score >= best["score"]:
+                row["vector_method"] = {
+                    "method_name": hit.get("method_name", ""),
+                    "score": round(score, 4),
+                    "file_path": hit.get("file_path", ""),
+                    "line_start": hit.get("line_start", 0),
+                    "line_end": hit.get("line_end", 0),
+                }
+
+        results = []
+        for row in merged.values():
+            rank = row.pop("_rank")
+            row["score"] = round(row["fts_score"] + row["vector_score"], 4)
+            row["rule_score"] = row["score"]
+            row["fts_score"] = round(row["fts_score"], 4)
+            row["vector_score"] = round(row["vector_score"], 4)
+            results.append((row, rank))
+        results.sort(key=lambda pair: (-pair[0]["score"], pair[1], pair[0]["class_name"]))
+        ordered = [row for row, _ in results]
+
+        rerank_hint = ""
+        if rerank and ordered:
+            by_name = {row["class_name"]: row for row in ordered}
+            head = ordered[:RERANK_CANDIDATES]
+            chosen = {row["class_name"] for row in head}
+            for hit in vector_hits[:VECTOR_RERANK_TOP]:
+                row = by_name.get(hit["class_name"])
+                if row is not None and row["class_name"] not in chosen:
+                    head.append(row)
+                    chosen.add(row["class_name"])
+            documents = [self._rerank_document(row) for row in head]
+            try:
+                ce_scores = self._rerank_model().scores(query, documents)
+            except RerankUnavailable as exc:
+                ce_scores = []
+                rerank_hint = str(exc)
+            if ce_scores:
+                for row, ce in zip(head, ce_scores):
+                    row["rerank_score"] = round(ce, 4)
+                    row["score"] = row["rerank_score"]
+                # 规则只负责召回；候选内部由 Cross-Encoder 决定顺序。
+                head.sort(
+                    key=lambda row: (
+                        -row["rerank_score"],
+                        -row["rule_score"],
+                        row["class_name"],
+                    )
+                )
+                rest = [row for row in ordered if row["class_name"] not in chosen]
+                ordered = head + rest
+
+        top = ordered[:limit]
+        return {
+            **base,
+            "available": True,
+            "vector_available": available,
+            "reranked": any("rerank_score" in row for row in top),
+            "hint": hint or rerank_hint,
+            "count": len(top),
+            "results": top,
+            "summary": {
+                "fts_hits": sum(1 for row in merged.values() if "fts" in row["sources"]),
+                "vector_hits": len(vector_hits),
+            },
+        }
+
+    def _rerank_model(self) -> CrossEncoderReranker:
+        if self._reranker is None:
+            self._reranker = CrossEncoderReranker()
+        return self._reranker
+
+    def _rerank_document(self, row: dict) -> str:
+        """精排输入：类名 + 最相近方法名 + 方法体（没有方法体时退回方法列表）。"""
+        parts = [row["class_name"]]
+        method = row.get("vector_method") or {}
+        body = ""
+        if method.get("method_name"):
+            parts.append(method["method_name"])
+            body = self._method_body(
+                method.get("file_path", ""),
+                int(method.get("line_start") or 0),
+                method["method_name"],
+            )
+        if body:
+            parts.append(body[:1200])
+        else:
+            names = [item.get("method_name", "") for item in row.get("methods") or []]
+            parts.extend(name for name in names if name)
+            if names:
+                first = row["methods"][0]
+                body = self._method_body(
+                    first.get("file_path", ""),
+                    int(first.get("line_start") or 0),
+                    first.get("method_name", ""),
+                )
+                if body:
+                    parts.append(body[:1200])
+        return "\n".join(parts)
 
     def search_symbol(self, name: str, limit: int = 10) -> dict:
         name = (name or "").strip()
@@ -1490,10 +1682,52 @@ class QueryService:
             )
         return self._embedding_cache
 
+    def _dense(self) -> DenseEmbedder:
+        """进程内复用同一个 embedding 模型，避免每次查询重新加载 0.6B ONNX。"""
+        if self._dense_embedder is None:
+            self._dense_embedder = DenseEmbedder(self._cache())
+        return self._dense_embedder
+
+    def _sparse(self) -> SparseEmbedder:
+        if self._sparse_embedder is None:
+            self._sparse_embedder = SparseEmbedder(self._cache())
+        return self._sparse_embedder
+
     def _vector_status(self) -> tuple[bool, str]:
         meta = read_meta(self.profile, self.db_path)
         if not meta.get("method_count"):
             return False, "向量索引未构建：先运行 python3 -m ios_qa vectors"
+        built_model = meta.get("model") or ""
+        built_dim = meta.get("dim")
+        if built_model and (built_model != EMBED_MODEL or built_dim != EMBED_DIM):
+            return False, (
+                f"向量索引由 {built_model}（{built_dim} 维）构建，"
+                f"当前模型 {EMBED_MODEL}（{EMBED_DIM} 维）："
+                "重新运行 python3 -m ios_qa vectors"
+            )
+        try:
+            previous = json.loads(
+                (vector_dir(self.profile, self.db_path) / HASH_FILE).read_text(
+                    encoding="utf-8"
+                )
+            ).get("files") or {}
+        except (OSError, ValueError):
+            previous = {}
+        if previous:
+            current = {
+                row["path"]: row["sha256"]
+                for row in self.conn.execute("SELECT path, sha256 FROM files")
+            }
+            stale = {
+                path
+                for path in set(previous) | set(current)
+                if previous.get(path) != current.get(path)
+            }
+            if stale:
+                return False, (
+                    f"{len(stale)} 个文件的源码在向量构建后变更："
+                    "重新运行 python3 -m ios_qa vectors（增量，只重算变更文件）"
+                )
         try:
             if not self._vectors().collection_exists():
                 return False, "向量索引缺失 collection：重新运行 vectors"
@@ -1538,12 +1772,11 @@ class QueryService:
             return {**base, "available": False, "hint": hint}
         store = self._vectors()
         try:
-            cache = self._cache()
-            dense = DenseEmbedder(cache).embed_query(query_text(query))
+            dense = self._dense().embed_query(query_text(query))
             fusion = "dense"
             if store.sparse:
                 try:
-                    sparse = SparseEmbedder(cache).embed_query(query_text(query))
+                    sparse = self._sparse().embed_query(query)
                     hits = store.search_hybrid(dense, sparse, limit, module)
                     fusion = "rrf"
                 except EmbeddingUnavailable:
@@ -1659,7 +1892,7 @@ class QueryService:
         store = self._vectors()
         try:
             cache = self._cache()
-            dense = DenseEmbedder(cache).embed_query(snippet_text(code))
+            dense = self._dense().embed_query(snippet_text(code))
         except EmbeddingUnavailable as exc:
             return {**base, "available": False, "hint": str(exc)}
         hits = store.search_dense(dense, limit * 2, module)

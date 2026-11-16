@@ -109,6 +109,9 @@ def _seeds(db_path: str | Path) -> dict[str, str]:
 SERVICE_CALLS: dict[str, Callable[[QueryService, dict], Any]] = {
     "kb_info": lambda s, a: s.info(),
     "find_feature": lambda s, a: s.find_feature(a["query"], limit=a["limit"]),
+    "hybrid_find_feature": lambda s, a: s.hybrid_find_feature(
+        a["query"], limit=a["limit"], module=a["module"], rerank=a["rerank"]
+    ),
     "search_symbol": lambda s, a: s.search_symbol(a["name"], limit=a["limit"]),
     "trace_class": lambda s, a: s.trace_class(a["class_name"], limit=a["limit"]),
     "search_methods": lambda s, a: s.search_methods(
@@ -163,6 +166,12 @@ def build_cases(db_path: str | Path) -> list[dict]:
     args: dict[str, dict] = {
         "kb_info": {},
         "find_feature": {"query": cls, "limit": 5},
+        "hybrid_find_feature": {
+            "query": cls,
+            "limit": 5,
+            "module": "",
+            "rerank": False,
+        },
         "search_symbol": {"name": cls, "limit": 5},
         "trace_class": {"class_name": cls, "limit": 20},
         "search_methods": {

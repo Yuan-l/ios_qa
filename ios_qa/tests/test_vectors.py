@@ -20,10 +20,12 @@ from ios_qa.build import build
 from ios_qa.config import ProjectProfile
 from ios_qa.embedding import (
     EMBED_DIM,
+    QUERY_INSTRUCTION,
     EmbeddingCache,
     SparseVectorData,
     cache_key,
     document_text,
+    get_profile,
     pack_vector,
     query_text,
     snippet_text,
@@ -89,13 +91,46 @@ class FakeSparseEmbedder:
         return SparseVectorData(indices, [1.0 for _ in indices])
 
 
+class FakeReranker:
+    def __init__(self, score: float = 0.9) -> None:
+        self.score = score
+
+    def scores(self, query: str, documents: list[str]) -> list[float]:
+        return [self.score for _ in documents]
+
+
+def fake_vector_layer():
+    """查询侧换成假 embedder，同时对齐 ``_vector_status`` 的模型契约。"""
+    return mock.patch.multiple(
+        "ios_qa.query",
+        DenseEmbedder=FakeDenseEmbedder,
+        SparseEmbedder=FakeSparseEmbedder,
+        EMBED_MODEL=FakeDenseEmbedder.model,
+        EMBED_DIM=FakeDenseEmbedder.dim,
+    )
+
+
 class EmbeddingTextTest(unittest.TestCase):
-    def test_document_query_snippet_prefixes(self) -> None:
+    def test_default_profile_is_qwen3(self) -> None:
         text = document_text("TBAlphaView", "loadData", "x" * 3000)
+        self.assertEqual(text, "类:TBAlphaView 方法:loadData\n" + "x" * 2000)
+        self.assertEqual(
+            query_text(" 行情 "),
+            "Instruct: " + QUERY_INSTRUCTION + "\nQuery: 行情",
+        )
+        self.assertEqual(snippet_text("- (void)run {}"), "- (void)run {}")
+
+    def test_bge_profile_prefixes(self) -> None:
+        profile = get_profile("bge-small-zh")
+        text = profile.document_text("TBAlphaView", "loadData", "x" * 3000)
         self.assertTrue(text.startswith("search_document: 类:TBAlphaView 方法:loadData\n"))
         self.assertEqual(len(text.split("\n", 1)[1]), 2000)
-        self.assertEqual(query_text(" 行情 "), "search_query: 行情")
-        self.assertTrue(snippet_text("- (void)run {}").startswith("search_document: "))
+        self.assertEqual(profile.query_text(" 行情 "), "search_query: 行情")
+        self.assertTrue(profile.snippet_text("- (void)run {}").startswith("search_document: "))
+
+    def test_unknown_profile_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            get_profile("no-such-model")
 
     def test_cache_key_and_pack(self) -> None:
         self.assertEqual(cache_key("m", "t"), cache_key("m", "t"))
@@ -279,9 +314,7 @@ class VectorBuildTest(unittest.TestCase):
     def test_query_service_semantic_layer(self) -> None:
         _report, store = self._build(full=True)
         store.close()
-        with mock.patch("ios_qa.query.DenseEmbedder", FakeDenseEmbedder), mock.patch(
-            "ios_qa.query.SparseEmbedder", FakeSparseEmbedder
-        ), QueryService(self.profile, self.db_path) as service:
+        with fake_vector_layer(), QueryService(self.profile, self.db_path) as service:
             search = service.vector_search("load quotes category", limit=5)
             self.assertTrue(search["available"])
             self.assertEqual(search["fusion"], "rrf")
@@ -306,6 +339,63 @@ class VectorBuildTest(unittest.TestCase):
             self.assertIn("source_code", snippet["results"][0])
             self.assertIn("fetchQuotesForCategory", snippet["results"][0]["source_code"])
 
+    def test_hybrid_find_feature_merges_by_class(self) -> None:
+        _report, store = self._build(full=True)
+        store.close()
+        with fake_vector_layer(), QueryService(self.profile, self.db_path) as service:
+            data = service.hybrid_find_feature(
+                "load quotes category", limit=5, rerank=False
+            )
+        self.assertTrue(data["available"])
+        self.assertTrue(data["vector_available"])
+        self.assertTrue(data["results"])
+        scores = [row["score"] for row in data["results"]]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+        self.assertTrue(
+            any("vector" in row["sources"] for row in data["results"]),
+            data["results"],
+        )
+        for row in data["results"]:
+            if "vector" in row["sources"]:
+                self.assertTrue(row["vector_method"]["method_name"])
+                break
+
+    def test_hybrid_rerank_blends_scores(self) -> None:
+        _report, store = self._build(full=True)
+        store.close()
+        with fake_vector_layer(), mock.patch(
+            "ios_qa.query.CrossEncoderReranker", FakeReranker
+        ), QueryService(self.profile, self.db_path) as service:
+            data = service.hybrid_find_feature("load quotes category", limit=5)
+        self.assertTrue(data["reranked"])
+        for row in data["results"]:
+            self.assertIn("rerank_score", row)
+        scores = [row["score"] for row in data["results"]]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+
+    def test_vector_status_rejects_model_mismatch(self) -> None:
+        _report, store = self._build(full=True)
+        store.close()
+        with mock.patch("ios_qa.query.EMBED_MODEL", "other/model"), QueryService(
+            self.profile, self.db_path
+        ) as service:
+            data = service.vector_search("load quotes")
+        self.assertFalse(data["available"])
+        self.assertIn("重新运行", data["hint"])
+
+    def test_vector_status_detects_stale_source(self) -> None:
+        _report, store = self._build(full=True)
+        store.close()
+        self.alpha.write_text(
+            self.alpha.read_text(encoding="utf-8") + "\n// changed\n",
+            encoding="utf-8",
+        )
+        build(self.profile, self.db_path, verbose=False)
+        with fake_vector_layer(), QueryService(self.profile, self.db_path) as service:
+            data = service.vector_search("load quotes")
+        self.assertFalse(data["available"])
+        self.assertIn("变更", data["hint"])
+
     def test_unavailable_message_when_no_vectors(self) -> None:
         with QueryService(self.profile, self.db_path) as service:
             data = service.vector_search("行情")
@@ -325,9 +415,7 @@ class VectorBuildTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("points=2", buffer.getvalue())
 
-        with mock.patch("ios_qa.query.DenseEmbedder", FakeDenseEmbedder), mock.patch(
-            "ios_qa.query.SparseEmbedder", FakeSparseEmbedder
-        ):
+        with fake_vector_layer():
             with contextlib.redirect_stdout(io.StringIO()) as buffer:
                 code = cli.main(["semantic", "load quotes", *base])
             self.assertEqual(code, 0)

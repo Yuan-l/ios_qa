@@ -166,7 +166,7 @@ def build_vectors(
         cache = cache or EmbeddingCache(db.parent / "embedding_cache.db")
         dense = dense_embedder or DenseEmbedder(cache)
         sparse = sparse_embedder or SparseEmbedder(cache)
-        # 维度跟着 provider 走：真模型是 512，测试里的假 embedder 是 8
+        # 维度跟着 provider 走：真模型是 1024，测试里的假 embedder 是 8
         dim = int(getattr(dense, "dim", EMBED_DIM))
         model_name = getattr(dense, "model", EMBED_MODEL)
         sparse_name = getattr(sparse, "model", SPARSE_MODEL)
