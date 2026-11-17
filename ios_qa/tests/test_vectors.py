@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import struct
 import tempfile
 import unittest
@@ -34,7 +35,7 @@ from ios_qa.embedding import (
 from ios_qa.fingerprint import code_tokens
 from ios_qa.query import QueryService
 from ios_qa.vector_build import build_vectors, method_document, read_meta, vector_dir
-from ios_qa.vector_store import VectorStore, point_id
+from ios_qa.vector_store import BODY_VECTOR, DENSE_VECTOR, VectorStore, point_id
 
 try:
     import qdrant_client  # noqa: F401
@@ -203,8 +204,35 @@ IMPL = """\
     [self.tableView reloadData];
     [self updateEmptyState:items.count];
     [self trackEvent:@"finance.home.load"];
+{body}
 }}
 @end
+"""
+
+
+SWIFT_OVERLOAD = """\
+import Foundation
+
+final class TBDualInit: NSObject {
+    var value = 0
+    var label = ""
+    var extra = true
+
+    init(value: Int, label: String) {
+        self.value = value
+        self.label = label
+        self.extra = value > 0
+        super.init()
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        self.value = try container.decode(Int.self)
+        self.label = try container.decode(String.self)
+        self.extra = false
+        super.init()
+    }
+}
 """
 
 
@@ -224,7 +252,8 @@ class VectorBuildTest(unittest.TestCase):
         self.root = Path(self._tmp.name)
         (self.root / "App").mkdir()
         self.alpha = _write_view(self.root, "TBAlphaView")
-        _write_view(self.root, "TBBetaView")
+        # Beta 用一段独有语句，避免两个方法的方法体完全相同（片段自查会并列）
+        _write_view(self.root, "TBBetaView", body="    [self.betaOnlySink consume];")
         self.db_path = self.root / "kb.db"
         self.profile = ProjectProfile(name="Demo", root=self.root, source_dirs=["."])
         build(self.profile, self.db_path, full=True, verbose=False)
@@ -265,6 +294,83 @@ class VectorBuildTest(unittest.TestCase):
             self.assertGreater(second.points_written, 0)
         finally:
             store.close()
+
+    def test_full_build_writes_both_dense_channels(self) -> None:
+        """片段通道和文档通道都是命名向量，meta 与 collection 都要记录。"""
+        report, store = self._build(full=True)
+        try:
+            self.assertEqual(report.vectors, [DENSE_VECTOR, BODY_VECTOR])
+            meta = read_meta(self.profile, self.db_path)
+            self.assertEqual(meta["vectors"], [DENSE_VECTOR, BODY_VECTOR])
+            self.assertEqual(store.vector_names(), [DENSE_VECTOR, BODY_VECTOR])
+            point = store.find_method("TBAlphaView", "loadQuotesForCategory:")
+            self.assertTrue(point["dense"])
+            self.assertTrue(point["dense_body"])
+            self.assertEqual(report.body_embedded, 2)
+        finally:
+            store.close()
+
+    def test_snippet_self_lookup_is_near_one(self) -> None:
+        """同构的片段通道：贴一段已索引的 body，第一名是它自己且分数≈1。"""
+        _report, store = self._build(full=True)
+        store.close()
+        with fake_vector_layer(), QueryService(self.profile, self.db_path) as service:
+            row = service.conn.execute(
+                "SELECT body FROM methods WHERE class_name='TBAlphaView' "
+                "AND method_name='loadQuotesForCategory:'"
+            ).fetchone()
+            data = service.search_similar_snippet(
+                row["body"], limit=3, min_similarity=0.0
+            )
+        self.assertTrue(data["available"], data.get("hint"))
+        self.assertTrue(data["results"])
+        top = data["results"][0]
+        self.assertEqual(
+            (top["class_name"], top["method_name"]),
+            ("TBAlphaView", "loadQuotesForCategory:"),
+        )
+        self.assertGreater(top["similarity"], 0.99)
+
+    def test_snippet_and_similar_code_use_body_channel(self) -> None:
+        """路由不变量：片段/以方法找相似走 dense_body，自然语言检索走 dense。"""
+        _report, store = self._build(full=True)
+        store.close()
+        calls: list[str] = []
+        base = VectorStore
+
+        class RecordingStore(base):  # type: ignore[misc, valid-type]
+            def search_dense(self, vector, limit, module="", using=DENSE_VECTOR):
+                calls.append(using)
+                return super().search_dense(vector, limit, module, using=using)
+
+        with fake_vector_layer(), mock.patch(
+            "ios_qa.vector_store.VectorStore", RecordingStore
+        ), QueryService(self.profile, self.db_path) as service:
+            service.vector_search("load quotes category", limit=3)
+            natural_language_calls = list(calls)
+            service.find_similar_code(
+                "TBAlphaView.loadQuotesForCategory:", mode="semantic", limit=3
+            )
+            service.search_similar_snippet(
+                "- (void)run { [self.tableView reloadData]; }", limit=3
+            )
+        # 自然语言检索走 hybrid（dense + sparse RRF），不碰片段通道
+        self.assertEqual(natural_language_calls, [])
+        self.assertEqual(calls, [BODY_VECTOR, BODY_VECTOR])
+
+    def test_vector_status_rejects_layout_without_body_channel(self) -> None:
+        """旧索引只有 dense：要给出重建提示，而不是让 Qdrant 抛未知向量名。"""
+        _report, store = self._build(full=True)
+        store.close()
+        meta_path = vector_dir(self.profile, self.db_path) / "build_meta.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta.pop("vectors", None)
+        meta_path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+        with fake_vector_layer(), QueryService(self.profile, self.db_path) as service:
+            available, hint = service._vector_status()
+        self.assertFalse(available)
+        self.assertIn(BODY_VECTOR, hint)
+        self.assertIn("vectors", hint)
 
     def test_method_document_uses_synonyms_and_comment(self) -> None:
         groups = [["崩溃", "crash"], ["网络", "请求", "http", "api"]]
@@ -370,11 +476,54 @@ class VectorBuildTest(unittest.TestCase):
 
     def test_points_are_idempotent(self) -> None:
         _report, store = self._build(full=True)
+        point = store.find_method("TBAlphaView", "loadQuotesForCategory:")
         self.assertEqual(
-            store.find_method("TBAlphaView", "loadQuotesForCategory:")["id"],
-            point_id("App/TBAlphaView.m", "loadQuotesForCategory:"),
+            point["id"],
+            point_id(
+                "App/TBAlphaView.m",
+                "loadQuotesForCategory:",
+                point["payload"]["line_start"],
+            ),
         )
         store.close()
+
+    def test_overloaded_methods_get_distinct_points(self) -> None:
+        """同一个文件里的同名重载不能共用一个 point。
+
+        历史缺陷：point_id 只用 ``file:method``，Swift 的 ``init`` 与
+        ``init(from:)`` 都叫 ``init``，后写入的覆盖前一个，导致 356 字符的
+        init 根本不在索引里（查自身 0.59）。
+        """
+        (self.root / "App" / "TBDualInit.swift").write_text(
+            SWIFT_OVERLOAD, encoding="utf-8"
+        )
+        build(self.profile, self.db_path, verbose=False)
+        report, store = self._build(full=True)
+        try:
+            db = sqlite3.connect(self.db_path)
+            try:
+                lines = [
+                    row[0]
+                    for row in db.execute(
+                        "SELECT line_start FROM methods "
+                        "WHERE class_name='TBDualInit' AND method_name='init' "
+                        "ORDER BY line_start"
+                    )
+                ]
+            finally:
+                db.close()
+            self.assertEqual(len(lines), 2, lines)
+            for line in lines:
+                point = store.find_method("TBDualInit", "init", line)
+                self.assertIsNotNone(point, line)
+                self.assertEqual(point["payload"]["line_start"], line)
+            # 不给行号时稳定取最靠前的一条
+            first = store.find_method("TBDualInit", "init")
+            self.assertEqual(first["payload"]["line_start"], lines[0])
+            # 两个 init 各自占一个 point：2 个 View 方法 + 2 个 init
+            self.assertEqual(report.methods_selected, 4)
+        finally:
+            store.close()
 
     def test_query_service_semantic_layer(self) -> None:
         _report, store = self._build(full=True)

@@ -10,7 +10,7 @@
 - **中文全文检索**：CJK 单字 + bigram 预分词，不依赖 jieba；支持业务别名扩展
 - **查询 CLI**：功能检索、符号、调用、影响面、页面入口路径、通知配对
 - **重复/相似代码**：词法指纹（改局部变量名也能认出复制粘贴），精确 + 近似重复聚类
-- **语义检索**：Qdrant 双通道（Qwen3-1024 稠密 + BM42 稀疏，RRF 融合）+ Cross-Encoder 精排，自然语言找方法体
+- **语义检索**：Qdrant 三个命名向量（Qwen3-1024：`dense` 文档通道 + `dense_body` 片段通道；BM42 稀疏）+ Cross-Encoder 精排；自然语言找方法体，贴代码找自身
 - **MCP server**：19 个工具，可直接接任意支持 stdio 的 MCP 客户端
 
 查询层（`query.py`）不依赖 CLI / MCP，后续接 Agent Loom 只需换接入层。
@@ -149,7 +149,7 @@ IOS_QA_ROOT=~/work/AppA python3 -m ios_qa build
 | `similar <目标>` | 找相似方法；默认词法指纹（`--min-similarity` 0.3），`--mode semantic` 走 Qdrant |
 | `duplicates` | 重复代码聚类；`--min-lines`（默认 6）/ `--min-similarity`（默认 0.8）/ `--class` |
 | `semantic <查询>` | 自然语言语义检索方法体；`--module` / `--limit`（默认 5） |
-| `similar-snippet <文件>` | 任意代码片段找语义相近的方法；`--min-similarity`（默认 0.75，索引文本含注释/标签后自相似约 0.80） |
+| `similar-snippet <文件>` | 任意代码片段找语义相近的方法；`--min-similarity`（默认 0.75，走 `dense_body`，贴已索引代码时自相似≈1.0） |
 | `vectors` | 构建 Qdrant 向量索引；`--full` 重建 collection，`--limit` 调试 |
 | `module <名称>` | 模块概览 |
 | `qa save/search/delete` | 历史问答知识库 |
@@ -312,7 +312,7 @@ ios_qa/                包（pip 安装的模块）
 │   └── ui.py          storyboard/xib：入口与 segue
 ├── fingerprint.py     代码指纹：token 归一化、MinHash、LSH 分带、Jaccard
 ├── embedding.py       Qwen3-1024 / BM42 provider + embedding_cache.db 缓存
-├── vector_store.py    Qdrant 本地模式：collection methods、dense/sparse/RRF
+├── vector_store.py    Qdrant 本地模式：collection methods、dense/dense_body/sparse/RRF
 ├── vector_build.py    向量索引构建：筛选、point_id、增量 file_hashes
 ├── db.py              DDL、增量写入、classes 聚合、指纹重建、FTS 重建
 ├── build.py           构建编排、git 元数据、build_runs
@@ -344,7 +344,7 @@ FTS5 虚表：
 `classes_fts`、`methods_fts`、`qa_fts`（全量重建，数据量级下成本可接受）
 
 语义索引（与数据库同在 `<工程>/.ios_qa/` 下，均 gitignored）：
-`qdrant_storage/`（collection `methods`，dense 1024 维 + sparse BM42）、
+`qdrant_storage/`（collection `methods`，`dense` + `dense_body` 各 1024 维 + sparse BM42）、
 `embedding_cache.db`（`cache` 稠密 / `sparse_cache` 稀疏）、
 `qdrant_storage/build_meta.json`、`qdrant_storage/file_hashes.json`
 
@@ -522,13 +522,13 @@ $ python3 -m ios_qa duplicates --min-lines 10 --limit 1
 |---|---|
 | 稠密模型 `BAAI/bge-small-zh-v1.5`，512 维 | 默认改为 `Qwen/Qwen3-Embedding-0.6B-Q`（1024 维，INT8）；BGE-512 保留为 profile 用于对照，见下文「模型选型」 |
 | 稀疏 BM42（`Qdrant/bm42-all-minilm-l6-v2-attentions`） | 一致，与稠密向量同写一个 collection |
-| collection `methods`，dense 余弦 | 一致 |
+| collection `methods`，dense 余弦 | 一致；另加第二个 dense 命名向量 `dense_body` 服务片段检索（见下） |
 | Hybrid = dense + sparse，Qdrant 原生 RRF（k=60） | 一致，`Prefetch` + `Fusion.RRF` |
 | `hybrid_find_feature`：FTS + 向量，按类去重 | 已实现（Tool 14）；FTS 分归一到 0-1，向量用 cosine × 0.8 |
 | Cross-Encoder 精排 | 新增：`BAAI/bge-reranker-v2-m3-int8` 方法级精排（FTS 方法 top-15 + 向量 top-15，同类取最高分） |
 | 索引文本 `search_document: 类:{class} 方法:{method}\n{body[:2000]}` | 追加**文档注释**与**同义词标签**：`类:{class} 方法:{method}\n业务标签:{tags}\n{comment}\n{body}`；BGE profile 保留 `search_document:` 前缀 |
 | 查询文本 `search_query: {query}`；片段 `search_document: {code}` | Qwen profile 用 `Instruct: {task}\nQuery: {query}`，片段裸代码；BGE profile 保留原前缀 |
-| `point_id = MD5(file_path:method_name)[:16]` | 一致，upsert 天然幂等 |
+| `point_id = MD5(file_path:method_name)[:16]` | **改为** `MD5(file_path:method_name:line_start)[:16]`：参考方案漏了行号，同文件里的重载方法（Swift `init` / `init(from:)`）会映射到同一个 point 互相覆盖 |
 | payload：class/method/module/language/file/line/body_preview | 一致 |
 | 跳过 <3 行或 <80 字符的方法 | 一致 |
 | `embedding_cache.db`：key=`MD5("{model}:{text}")`，float32 BLOB | 一致，稠密 `cache` + 稀疏 `sparse_cache`；另加 `rerank_cache` 缓存精排分 |
@@ -544,6 +544,41 @@ $ python3 -m ios_qa duplicates --min-lines 10 --limit 1
   （如 `TBCrashReporter` 命中 `crash`）时，把组里尚未出现的词写进
   `业务标签:` 行（`崩溃 crash`）。这样「崩溃日志怎么上报」能命中英文命名的类；
   每方法最多 3 组、12 个词，避免标签压过方法体。
+
+### 两个 dense 通道：文档向量与片段向量
+
+参考方案只有一个 dense。我们拆成两个命名向量，因为**片段检索和自然语言检索的
+查询文本不同构**：
+
+| 通道 | 索引文本 | 查询文本 | 服务对象 |
+|---|---|---|---|
+| `dense` | 类/方法名 + 标签 + 注释 + 方法体 | `Instruct: …\nQuery: {问题}` | `vector_search` / `hybrid_find_feature` |
+| `dense_body` | `snippet_text(body)`（裸方法体） | `snippet_text(code)` | `search_similar_snippet` / `find_similar_code(mode=semantic)` |
+
+只用 `dense` 时，索引侧是「类/方法名 + 标签 + 注释 + 方法体」，查询侧只有方法体，
+两边不同构：`saveImageToTempDirectory` 原文自相似只有 0.803，而同一段文本走
+`dense_body` 是 0.9875。前缀里的类名/标签/注释会稀释方法体本身的信息。
+
+拆出同构的 `dense_body` 后，同一段代码在索引侧和查询侧是**同一份文本**，自相似
+≈1.0（查询侧不做 strip：Qwen3 用最后一个 token 的隐状态，首尾空白也参与
+tokenization，strip 后只能到 0.985），第二名仍是项目里的其他实现。
+
+`build_meta.json` 的 `vectors` 记录实际布局；旧索引没有 `dense_body` 时
+`_vector_status` 直接提示「重新运行 vectors（会全量重建）」，不会让 Qdrant 抛
+未知向量名。构建侧同样检查布局：collection 缺 `dense_body` 会强制全量重建。
+
+### point_id 必须带行号
+
+做这一轮验证时发现更隐蔽的一个坑：参考方案的
+`point_id = MD5(file_path:method_name)[:16]` 在**同文件同名方法**上会碰撞。
+Swift 的 `init` 与 `init(from:)` 解析出来都叫 `init`，两个方法映射到同一个
+point，后写入的覆盖先写入的。`TBCrashReport` 正好有这两个重载：索引里只剩下
+1008 字符的 `init(from:)`，用 356 字符的 `init` 去查自身只有 0.59——不是模型
+不行，也不是方法体太短，是**查的这一条根本没进索引**。
+
+现在 `point_id` 带上 `line_start`，`find_method` 支持按行号精确定位、缺省取最
+靠前的一条；`build_meta.json` / `file_hashes.json` 记录 `point_scheme`，旧方案
+构建的索引会强制全量重建（文本没变，命中 embedding 缓存，重算只要几秒）。
 
 精排是**方法级**的：`hybrid_find_feature` 用 FTS 方法命中 top-15 + 向量 top-15
 组成候选，对 `(问题, 类名 + 方法名 + 注释 + 方法体)` 逐对打分。只按类精排会
@@ -616,12 +651,12 @@ python3 -m ios_qa vectors --full       # 重建 collection
 
 python3 -m ios_qa semantic "相机拍照后怎么保存图片"
 python3 -m ios_qa similar MainCameraEditViewController.saveImageToTempDirectory --mode semantic
-python3 -m ios_qa similar-snippet SomeSnippet.m --min-similarity 0.9
+python3 -m ios_qa similar-snippet SomeSnippet.m --min-similarity 0.75
 ```
 
 ```text
 $ python3 -m ios_qa semantic "相机拍照后怎么保存图片"
-语义检索「相机拍照后怎么保存图片」  rrf  索引 1522 个方法
+语义检索「相机拍照后怎么保存图片」  rrf  索引 1563 个方法
 1. 0.833  TBSuperResolutionViewController.saveTapped  [TBImageEditorKit]
    components/TBImageEditorKit/TBImageEditorKit/Classes/UI/TBSuperResolutionViewController.swift:289-310
    guard let image = resultImage else { return } let loading = TBEditorHUD.show(in: view, text: "正在写入相册…")
@@ -645,18 +680,20 @@ python3 -m ios_qa hybrid "网络请求失败怎么重试" --no-rerank   # 只看
 - `query.py` 只依赖 `embedding.py` / `vector_store.py` 的接口，模型可换；
   没装依赖或没建索引时返回 `available=false` + `hint`，不抛异常；
 - `find_similar_code` 保留 `mode=lexical`（默认，golden 依赖），语义模式用源方法
-  的稠密向量取近邻，并附参考文档的复用建议阈值（≥0.95 高度重复 / ≥0.90
-  结构相近 / 其余部分相似）+ 短方法、骨架方法警告；
-- `search_similar_snippet` 把任意代码当文档向量化，返回时从源码读取
-  `source_code`，默认只保留 score ≥ 0.90；
+  的 `dense_body` 向量取近邻，并附参考文档的复用建议阈值（≥0.95 高度重复 /
+  ≥0.90 结构相近 / 其余部分相似）+ 短方法、骨架方法警告；
+- `search_similar_snippet` 用 `snippet_text(code)` 查询 `dense_body` 通道（与索引
+  侧同构），返回时从源码读取 `source_code`，默认只保留 score ≥ 0.75；
 - Qdrant 本地模式有目录锁：同一个 `qdrant_storage` 不能并发开两个 client，
   `QueryService.close()` 会按顺序关闭 store / 缓存 / SQLite。
 
-实测本工程：1946 个有方法体的方法 → 1522 个可向量化。Qwen3-INT8 冷启动全量
-`vectors` 约 78 分钟（CPU，`EMBED_BATCH=32`，模型已缓存；一次性成本）。之后
-增量索引只重算变更文件，2~4 秒。**改注释或 `.ios_qa/synonyms.json` 会让索引
-文本变化**：`template_id` 检测到契约变更后自动转全量重算（文本没变的走
-embedding 缓存，实测 1522 个方法 6.7 秒），不会静默留着旧向量。
+实测本工程：1960 个有方法体的方法 → 1563 个可向量化（`point_id` 带上行号后，
+先前被同名重载覆盖的 41 个方法也进了索引）。Qwen3-INT8 冷启动全量 `vectors`
+约 78 分钟（文档通道）+ 57 分钟（片段通道），CPU、`EMBED_BATCH=32`、模型已
+缓存；一次性成本。之后增量索引只重算变更文件，2~4 秒。**改注释或
+`.ios_qa/synonyms.json` 会让索引文本变化**：`template_id` 检测到契约变更后自动
+转全量重算（文本没变的走 embedding 缓存，实测 1500+ 个方法 6.7 秒），不会静默
+留着旧向量。
 同一进程内 embedding / reranker 只加载一次；命中 `embedding_cache` 与
 `rerank_cache` 的查询 0.02s，未命中时首次精排约 20s。只想快速重建时用
 `IOS_QA_EMBED_PROFILE=bge-small-zh`，冷启动全量约 3 秒。
@@ -731,7 +768,7 @@ python3 -m unittest discover -s /path/to/ios_qa/ios_qa/tests -t /path/to/ios_qa 
 - UI 文案：字面量提取（跳过注释/纯英文/超长）、类级检索命中
 - 多行类声明、头文件变更触发同目录实现重解析
 - 代码指纹：token 归一化（含 ObjC `@"..."`）、短方法过滤、精确/近似重复聚类
-- 向量层：文本前缀、缓存读写、Qdrant 构建/增量/删除、dense/sparse/RRF 查询
+- 向量层：文本前缀、缓存读写、Qdrant 构建/增量/删除、dense/dense_body/sparse/RRF 查询
 - MCP 工具集合与调用返回（19 个工具）
 - 双客户端验收：stdlib JSON-RPC 客户端、官方 SDK 客户端、`save_qa` 写路径往返、
   `mcp-smoke` 退出码
@@ -808,8 +845,12 @@ python3 -m ios_qa build --check
 | `vector_top` / `vector_contains` | 首条 / 任意一条结果是 `value`，且 `score` ≥ `min_score`，可选 `min_margin` |
 
 `min_margin` 是 `top1 − top2` 的下限。**向量类断言优先用它**：余弦相似度是
-相对量，换模型、改索引文本模板都会让绝对值整体平移（实测同为「方法体查自身」，
-在不同方法上落在 0.75~0.98），钉死绝对分数等于把实现细节写进验收。
+相对量，换模型、改索引文本模板都会让绝对值整体平移。片段通道同构后「方法体查
+自身」恒为 1.0，但第二名可能到 0.96（近重复实现），所以区分力看间隔；自然语言
+通道（`dense`）的刻度完全不同，两条通道的阈值不能混用。
+
+只有一种情况可以放心断言绝对分数：**查询与被索引文本完全相同**（片段自查）。
+这时 `min_score: 0.95` 是与模型无关的契约。
 
 ### 维护策略
 
@@ -844,15 +885,22 @@ snippet）+ 两个截断长度的指纹。把它抄进 `eval_cases.json` 顶层�
 阈值用 `calibrate` 标定，不靠手拍：
 
 ```bash
-python3 -m ios_qa calibrate --samples 30
-# 相似度标定  30 个方法（不同类各取一个）  template_id=168b2cee98f3
-#   自身    min=0.753 p05=0.79 p50=0.919 max=0.976
-#   第二名  min=0.581 p50=0.73 max=0.916
-#   间隔    min=0.038 p05=0.06 p50=0.175 max=0.302
-# 建议: min_score=0.77  min_margin=0.05
+python3 -m ios_qa calibrate --samples 60
+# 相似度标定  60 个方法（不同类各取一个）  template_id=168b2cee98f3
+#   自身    min=1.0 p05=1.0 p50=1.0 max=1.0
+#   第二名  min=0.549 p50=0.763 max=0.961
+#   间隔    min=0.039 p05=0.056 p50=0.248 max=0.451
+# 建议: min_score=0.98  min_margin=0.05
 ```
 
-注意「第二名 max=0.916」这类数字：绝对阈值挡不住它，只有 `min_margin` 能。
+`calibrate` 标定的是片段通道。自身恒为 1.0（同一份文本），所以 `min_score`
+只剩「确认是精确命中」的作用；真正的区分力看间隔。间隔最小 0.039 的那一对是
+两个近重复实现，这属于代码本身的问题，不是检索退化——`min_margin` 取 p05
+（0.056）向下取 0.05，避免把正常方法判红。
+
+`min_score=0.98` 不建议直接抄进用户输入场景：手工粘贴的代码首尾空白不同，
+自相似会掉到 0.985 左右。golden 里用 `min_score: 0.95`，命令行默认阈值保持
+0.75（挡掉伪代码/无关样板：实测 0.555 / 0.713）。
 
 ### 与参考文档的对应关系
 
@@ -886,7 +934,7 @@ python3 -m ios_qa calibrate --samples 30
 | 协议/block 调用 | `delegate?.captureOutput` → `CameraCaptureViewModelDelegate`；`onSelect` 4 处 block 调用 |
 | 分类归属 | `search_symbol("BreadCrumb")` 命中 `UIViewController` 等 5 个宿主类 |
 | 同名类消歧 | `trace TBTabbarViewController` 返回 2 个声明点，`--module` 切换后方法不串模块 |
-| 向量索引 | 1522 个方法（≥3 行且 ≥80 字符）；Qwen3 全量约 78 分钟（一次性），增量约 2~4s（大批文件移动时约 1 分钟） |
+| 向量索引 | 1563 个方法（≥3 行且 ≥80 字符，含同名重载）；`dense` + `dense_body` 两条通道，Qwen3 冷启动全量约 2.3 小时（一次性），增量约 2~4s；本次补重载 + 布局重建命中缓存约 160s |
 | `eval` golden 用例 | **38/38 通过**（含 2 条语义 + 7 条真实问答；无向量时 29 通过 + 9 跳过） |
 | MCP 双客户端验收 | `raw-jsonrpc` 与 `python-sdk` 各 19 个工具；18 个只读工具与查询层逐字段一致 |
 | UI 文案检索 | `find_feature("行情")` 命中 `TBFinanceHomeViewController`；注释里的中文不进类级检索 |
@@ -986,7 +1034,8 @@ python3 -m ios_qa notifications --unbalanced
 - **P3-b（已完成）**：向量语义检索 —— Qdrant `methods` collection（Qwen3-1024 +
   BM42，RRF k=60）、`embedding_cache.db`、`file_hashes.json` 增量；
   `vectors` / `semantic` / `similar-snippet`、`vector_search` /
-  `search_similar_snippet`、`find_similar_code(mode=semantic)`；
+  `search_similar_snippet`、`find_similar_code(mode=semantic)`（片段通道
+  `dense_body` 与文档通道 `dense` 分开）；
 - **P0（检索质量，已完成）**：模型 profile（默认 Qwen3-INT8，BGE/jina 可切）；
   `hybrid_find_feature`（FTS + cosine×0.8，按类合并）；Cross-Encoder
   `bge-reranker-v2-m3-int8` 精排；7 条真实问答 golden（top-3 断言）；golden 扩到 38 条；

@@ -186,6 +186,11 @@ def cmd_info(args) -> int:
     print("  表:", "  ".join(f"{k}={v}" for k, v in info["counts"].items()))
     print(f"  有方法体: {info['methods_with_body']}  "
           f"未配对通知: {info['unbalanced_notifications']}")
+    vectors = info.get("vectors") or {}
+    if vectors.get("available"):
+        channels = " + ".join(vectors.get("channels") or []) or "dense"
+        print(f"  向量: {vectors.get('model')} / {vectors.get('method_count')} 个方法"
+              f"  通道: {channels}")
     for warning in info["warnings"]:
         print(f"  ⚠️  {warning}")
     return 0
@@ -719,9 +724,12 @@ def cmd_vectors(args) -> int:
           f"  稀疏: {report.sparse_model}")
     if report.template_id:
         print(f"  文本契约: template_id={report.template_id}")
+    if report.vectors:
+        print(f"  通道: {' + '.join(report.vectors)}（dense=文档，dense_body=片段）")
     print(f"  方法: {report.methods_total} 个候选 / {report.methods_selected} 个可向量化")
     print(f"  写入: points={report.points_written}  "
           f"dense: embedded={report.embedded} cached={report.cached}  "
+          f"body: embedded={report.body_embedded} cached={report.body_cached}  "
           f"sparse: embedded={report.sparse_embedded} cached={report.sparse_cached}")
     print(f"  文件: {report.files_changed} 变更 / {report.files_deleted} 删除")
     print(f"  索引总量: {report.collection_points} 个方法向量")

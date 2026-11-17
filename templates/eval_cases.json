@@ -37,10 +37,11 @@
         {
           "kind": "vector_top",
           "value": "YourViewController.viewDidLoad",
+          "min_score": 0.95,
           "min_margin": 0.05
         }
       ],
-      "reason": "代码片段查自身：只断言首选是自己且与第二名有间隔，不断言模型相关的绝对分数",
+      "reason": "代码片段查自身：索引侧与查询侧都是裸方法体（dense_body），同一份文本的余弦≈1.0，所以可以断言 min_score；min_margin 再保证与第二名有间隔",
       "last_reviewed": "2026-11-18"
     }
   ]

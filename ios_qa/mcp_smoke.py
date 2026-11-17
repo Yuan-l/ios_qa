@@ -197,7 +197,7 @@ def build_cases(db_path: str | Path) -> list[dict]:
             "code": "- (void)reload { [self.tableView reloadData]; }",
             "limit": 5,
             "module": "",
-            "min_similarity": 0.9,
+            "min_similarity": 0.75,
         },
         "find_duplicates": {
             "min_lines": 6,

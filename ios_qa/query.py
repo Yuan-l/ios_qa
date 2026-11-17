@@ -37,6 +37,7 @@ from .rerank import (
 from .synonyms import expand_query, load_groups
 from .textnorm import build_search_text, fts_expr, like_pattern, snippet
 from .vector_build import HASH_FILE, read_meta, vector_dir
+from .vector_store import BODY_VECTOR
 
 # 混合检索里向量的权重：文档 Tool 14 用 0.8，让 FTS 精确命中优先。
 VECTOR_WEIGHT = 0.8
@@ -220,7 +221,14 @@ class QueryService:
             "dim": vector_meta.get("dim", 0),
             "method_count": vector_meta.get("method_count", 0),
             "build_time": vector_meta.get("build_time", ""),
+            "channels": list(vector_meta.get("vectors") or []),
+            "template_id": vector_meta.get("template_id", ""),
         }
+        if vector_meta and BODY_VECTOR not in (vector_meta.get("vectors") or []):
+            warnings.append(
+                "向量索引缺少片段通道 dense_body（旧布局），"
+                "片段检索不可用：重新运行 vectors"
+            )
         if vector_meta:
             built = vector_meta.get("build_time", "")
             if built:
@@ -1775,9 +1783,24 @@ class QueryService:
                     f"{len(stale)} 个文件的源码在向量构建后变更："
                     "重新运行 python3 -m ios_qa vectors（增量，只重算变更文件）"
                 )
+        # 片段通道 dense_body 是后加的第二个命名向量：旧索引里没有它，
+        # 片段查询会直接抛 Qdrant 的 "Not existing vector name"。这里提前
+        # 拦成可读提示，而不是让用户看到底层异常。
+        if meta.get("method_count") and BODY_VECTOR not in (meta.get("vectors") or []):
+            return False, (
+                "向量索引缺少片段通道 dense_body（旧布局）："
+                "重新运行 python3 -m ios_qa vectors（会全量重建）"
+            )
         try:
-            if not self._vectors().collection_exists():
+            store = self._vectors()
+            if not store.collection_exists():
                 return False, "向量索引缺失 collection：重新运行 vectors"
+            names = store.vector_names()
+            if names and BODY_VECTOR not in names:
+                return False, (
+                    "向量 collection 里没有片段通道 dense_body："
+                    "重新运行 python3 -m ios_qa vectors（会全量重建）"
+                )
         except Exception as exc:  # noqa: BLE001 - 依赖/存储异常都转成提示
             return False, f"向量库不可用：{exc}"
         return True, ""
@@ -1875,13 +1898,24 @@ class QueryService:
         if not available:
             return {**empty, "hint": hint}
         store = self._vectors()
-        source = store.find_method(class_name, method_name)
+        # 同名重载（Swift init / init(from:)）必须用行号定位到目标那一条；
+        # 不传行号时 find_method 取最靠前的一条，保证结果稳定。
+        row = self.conn.execute(
+            "SELECT line_start FROM methods WHERE class_name=? AND method_name=? "
+            "ORDER BY line_start LIMIT 1",
+            (class_name, method_name),
+        ).fetchone()
+        source = store.find_method(
+            class_name, method_name, int(row["line_start"]) if row else None
+        )
         if source is None:
             return {
                 **empty,
                 "hint": "向量索引里没有这个方法：可能方法太短，或 vectors 尚未更新",
             }
-        hits = store.search_dense(source["dense"], limit + 1, module)
+        hits = store.search_dense(
+            source["dense_body"], limit + 1, module, using=BODY_VECTOR
+        )
         results = []
         for hit in hits:
             if hit["class_name"] == class_name and hit["method_name"] == method_name:
@@ -1933,11 +1967,17 @@ class QueryService:
     ) -> dict:
         """任意代码片段找项目里语义相近的方法（参考方案同名的 Tool 11）。
 
-        索引文本除了方法体，还带类/方法名、同义词标签与文档注释，所以
-        「方法体查自己」的相似度在 0.80 左右（不是 1.0）；默认阈值 0.75 既能
-        命中自身，也能把第二名（约 0.70）挡在外面。
+        走独立的 ``dense_body`` 通道：索引侧用 ``snippet_text(body)``，查询侧用
+        ``snippet_text(code)``，两边同构，所以「贴一段已索引方法的代码」自相似
+        ≈1.0，不会被类名/注释/同义词标签稀释。自然语言检索（``vector_search``）
+        仍走 ``dense`` 文档通道——两条通道的文本模板不同，不能混用。
+
+        注意**不能对 code 做 strip 再嵌入**：Qwen3 用最后一个 token 的隐状态，
+        首尾空白也参与 tokenization，strip 后同一段方法体只能到 0.985。
+        这里只把 strip 用作空值判断，嵌入仍用传入原文。
         """
-        code = (code or "").strip()
+        text = code or ""
+        code = text.strip()
         limit = max(1, min(int(limit), 50))
         base = {
             "min_similarity": min_similarity,
@@ -1953,10 +1993,10 @@ class QueryService:
         store = self._vectors()
         try:
             cache = self._cache()
-            dense = self._dense().embed_query(snippet_text(code))
+            dense = self._dense().embed_query(snippet_text(text))
         except EmbeddingUnavailable as exc:
             return {**base, "available": False, "hint": str(exc)}
-        hits = store.search_dense(dense, limit * 2, module)
+        hits = store.search_dense(dense, limit * 2, module, using=BODY_VECTOR)
         results = []
         for hit in hits:
             score = float(hit["score"])
