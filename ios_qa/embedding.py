@@ -113,6 +113,29 @@ class EmbeddingProfile:
     def snippet_text(self, code: str) -> str:
         return self.snippet.format(code=(code or "")[:BODY_LIMIT])
 
+    @property
+    def template_id(self) -> str:
+        """「索引/查询文本契约」指纹：模型 + 三个模板 + 两个截断长度。
+
+        相似度是**相对**的：换模型或改模板都会让同一对文本的余弦整体平移
+        （实测无关方法之间余弦底噪约 0.40，不是 0）。所以模板改动必须被当成
+        契约变更——``build_meta.json`` 记录它，golden 用例也记录它，
+        两边不一致时用例转为「待人工复核」，而不是静默判红或判绿。
+        """
+        raw = "|".join(
+            (
+                self.name,
+                self.model,
+                str(self.dim),
+                self.document,
+                self.query,
+                self.snippet,
+                f"body={BODY_LIMIT}",
+                f"comment={COMMENT_LIMIT}",
+            )
+        )
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+
 
 PROFILES: dict[str, EmbeddingProfile] = {
     "qwen3-0.6b": EmbeddingProfile(
@@ -176,6 +199,11 @@ def query_text(query: str) -> str:
 
 def snippet_text(code: str) -> str:
     return ACTIVE_PROFILE.snippet_text(code)
+
+
+def template_id() -> str:
+    """当前索引/查询文本契约的指纹，见 :attr:`EmbeddingProfile.template_id`。"""
+    return ACTIVE_PROFILE.template_id
 
 
 def cache_key(model: str, text: str) -> str:

@@ -15,6 +15,7 @@ from typing import Any
 
 from .config import CONFIG_DIR_NAME, ProjectProfile
 from .query import QueryService
+from .vector_build import read_meta
 
 CASES_FILENAME = "eval_cases.json"
 
@@ -112,7 +113,7 @@ def _call(service: QueryService, case: dict) -> dict:
             code,
             limit=args.get("limit", 5),
             module=args.get("module", ""),
-            min_similarity=args.get("min_similarity", 0.90),
+            min_similarity=args.get("min_similarity", 0.75),
         )
     if kind == "find_notifications":
         return service.find_notifications(
@@ -147,6 +148,46 @@ def _dig(data: Any, path: str) -> Any:
 def _class_names(data: dict) -> list[str]:
     rows = data.get("results") or data.get("pages") or []
     return [row.get("class_name", "") for row in rows if row.get("class_name")]
+
+
+def _rank_check(
+    data: dict, spec: dict, field: str, top_only: bool
+) -> tuple[bool, str]:
+    """排序类断言：命中位置 + 可选的最低分 + 可选的「与第二名的间隔」。
+
+    绝对分数是模型/模板相关的（换模型会整体平移），所以「能不能区分」
+    用 ``min_margin`` 断言更稳：只要求 top1 比 top2 高出一定间隔。
+    """
+    rows = data.get("results") or []
+    threshold_key = "min_similarity" if field == "similarity" else "min_score"
+    threshold = float(spec.get(threshold_key, 0.0))
+    margin_need = spec.get("min_margin")
+    view = rows[:1] if top_only else rows
+    seen = [
+        f"{row.get('class_name')}.{row.get('method_name')}={row.get(field)}"
+        for row in view
+    ]
+    ok = any(
+        f"{row.get('class_name')}.{row.get('method_name')}" == spec["value"]
+        and float(row.get(field) or 0) >= threshold
+        for row in view
+    )
+    margin: float | None
+    if len(rows) >= 2:
+        margin = float(rows[0].get(field) or 0) - float(rows[1].get(field) or 0)
+    elif rows:
+        margin = float(rows[0].get(field) or 0)
+    else:
+        margin = None
+    if margin_need is not None:
+        need = float(margin_need)
+        ok = ok and margin is not None and margin >= need
+    detail = f"{threshold_key}={threshold}"
+    if margin_need is not None:
+        detail += f" min_margin={margin_need}"
+    if margin is not None:
+        detail += f" margin={margin:.4f}"
+    return ok, f"{detail} seen={seen}"
 
 
 def _check(data: dict, spec: dict) -> tuple[bool, str]:
@@ -212,20 +253,7 @@ def _check(data: dict, spec: dict) -> tuple[bool, str]:
         return bool(data.get("available")), f"available={data.get('available')} hint={data.get('hint', '')}"
 
     if kind in {"vector_top", "vector_contains"}:
-        results = data.get("results") or []
-        threshold = float(spec.get("min_score", 0.0))
-        if kind == "vector_top":
-            results = results[:1]
-        seen = [
-            f"{row.get('class_name')}.{row.get('method_name')}={row.get('score')}"
-            for row in results
-        ]
-        ok = any(
-            f"{row.get('class_name')}.{row.get('method_name')}" == spec["value"]
-            and float(row.get("score") or 0) >= threshold
-            for row in results
-        )
-        return ok, f"min_score={threshold} seen={seen}"
+        return _rank_check(data, spec, field="score", top_only=kind == "vector_top")
 
     if kind == "similar_found":
         return bool(data.get("found")), (
@@ -233,20 +261,9 @@ def _check(data: dict, spec: dict) -> tuple[bool, str]:
         )
 
     if kind in {"similar_top", "similar_contains"}:
-        results = data.get("results") or []
-        threshold = float(spec.get("min_similarity", 0.0))
-        if kind == "similar_top":
-            results = results[:1]
-        seen = [
-            f"{row.get('class_name')}.{row.get('method_name')}={row.get('similarity')}"
-            for row in results
-        ]
-        ok = any(
-            f"{row.get('class_name')}.{row.get('method_name')}" == spec["value"]
-            and float(row.get("similarity") or 0) >= threshold
-            for row in results
+        return _rank_check(
+            data, spec, field="similarity", top_only=kind == "similar_top"
         )
-        return ok, f"threshold={threshold} seen={seen}"
 
     if kind == "duplicate_group":
         wanted = set(spec["members"])
@@ -416,6 +433,7 @@ def run_eval(
             "passed": 0,
             "failed": 0,
             "skipped": 0,
+            "needs_review": 0,
             "missing": True,
             "cases_path": str(path),
             "cases": [],
@@ -425,6 +443,21 @@ def run_eval(
     if only:
         selected = set(only)
         cases = [c for c in cases if c.get("id") in selected]
+
+    # 索引文本契约（模型 + 模板）变了，golden 里的分数/排序必须人工复核：
+    # 相似度是相对量，模板一改刻度就平移，自动判红或判绿都会误导。
+    meta = read_meta(profile, db_path)
+    built_template = str(meta.get("template_id") or "")
+    case_template = str(config.get("template_id") or "")
+    template_stale = bool(built_template and case_template and built_template != case_template)
+    template_warning = ""
+    if not template_stale:
+        if not case_template:
+            template_warning = (
+                "golden 未绑定 template_id，改造索引文本后请人工复核向量类用例"
+            )
+        elif not built_template:
+            template_warning = "向量索引缺少 template_id（旧索引），建议重新运行 vectors"
 
     results: list[dict] = []
     with QueryService(profile, db_path) as service:
@@ -443,6 +476,26 @@ def run_eval(
                             "skipped": True,
                             "skip_reason": hint,
                             "checks": [{"kind": "skipped", "ok": True, "detail": hint}],
+                        }
+                    )
+                    continue
+                if template_stale:
+                    detail = (
+                        f"索引 template_id={built_template}，"
+                        f"用例 template_id={case_template}，需人工复核后更新用例"
+                    )
+                    results.append(
+                        {
+                            "id": case.get("id", ""),
+                            "type": case.get("type", ""),
+                            "reason": case.get("reason") or case.get("note", ""),
+                            "last_reviewed": case.get("last_reviewed", ""),
+                            "ok": False,
+                            "needs_review": True,
+                            "review_reason": detail,
+                            "checks": [
+                                {"kind": "template_changed", "ok": False, "detail": detail}
+                            ],
                         }
                     )
                     continue
@@ -468,11 +521,20 @@ def run_eval(
             )
 
     skipped = sum(1 for item in results if item.get("skipped"))
-    passed = sum(1 for item in results if item["ok"] and not item.get("skipped"))
+    review = sum(1 for item in results if item.get("needs_review"))
+    passed = sum(
+        1
+        for item in results
+        if item["ok"] and not item.get("skipped") and not item.get("needs_review")
+    )
     return {
         "total": len(results),
         "passed": passed,
-        "failed": len(results) - passed - skipped,
+        "failed": len(results) - passed - skipped - review,
         "skipped": skipped,
+        "needs_review": review,
+        "template_id": built_template,
+        "case_template_id": case_template,
+        "template_warning": template_warning,
         "cases": results,
     }

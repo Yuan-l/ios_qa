@@ -249,6 +249,23 @@ class VectorBuildTest(unittest.TestCase):
             cache.close()
         return report, store
 
+    def test_template_change_forces_full_rebuild(self) -> None:
+        """模板变了但源码没变：增量构建不能因为 sha256 相同就跳过重算。"""
+        first, store = self._build(full=True)
+        store.close()
+        self.assertTrue(first.template_id)
+        with mock.patch(
+            "ios_qa.vector_build.template_id", return_value="changed-template"
+        ):
+            second, store = self._build()
+        try:
+            self.assertEqual(second.mode, "full")
+            self.assertEqual(second.template_id, "changed-template")
+            self.assertGreater(second.files_changed, 0)
+            self.assertGreater(second.points_written, 0)
+        finally:
+            store.close()
+
     def test_method_document_uses_synonyms_and_comment(self) -> None:
         groups = [["崩溃", "crash"], ["网络", "请求", "http", "api"]]
         row = {
@@ -434,6 +451,50 @@ class VectorBuildTest(unittest.TestCase):
             document = service._rerank_document(pairs[0])
             self.assertIn(pairs[0]["class_name"], document)
             self.assertIn(pairs[0]["method_name"], document)
+
+    def test_rerank_documents_are_built_from_the_pairs(self) -> None:
+        """不变量：精排输入必须由候选自身构造。
+
+        历史缺陷：用「类 + 向量最近的方法」当 document，向量最近的方法可能是
+        无关实现，CE 于是给错的对象打分（行情页选中 tb_updateMonitorScreen）。
+        这里断言 CE 收到的每一份文档，前两行是真实存在的 (类, 方法)，且文档里
+        带的是这个方法自己的方法体。
+        """
+        class RecordingReranker(FakeReranker):
+            documents: list[str] = []
+
+            def scores(self, query: str, documents: list[str]) -> list[float]:
+                RecordingReranker.documents = list(documents)
+                return super().scores(query, documents)
+
+        _report, store = self._build(full=True)
+        store.close()
+        with fake_vector_layer(), mock.patch(
+            "ios_qa.query.CrossEncoderReranker", RecordingReranker
+        ), QueryService(self.profile, self.db_path) as service:
+            data = service.hybrid_find_feature("load quotes", limit=5)
+            recorded = RecordingReranker.documents
+            self.assertTrue(recorded)
+            for document in recorded:
+                first, second = document.splitlines()[:2]
+                row = service.conn.execute(
+                    "SELECT body FROM methods WHERE class_name=? AND method_name=? "
+                    "ORDER BY line_start LIMIT 1",
+                    (first, second),
+                ).fetchone()
+                self.assertIsNotNone(row, f"精排文档头不是候选: {first}.{second}")
+                body = (row["body"] or "").strip()
+                if body:
+                    # 文档必须带上这个方法自己的方法体，而不是同类里别的方法
+                    self.assertIn(body.splitlines()[0].strip(), document)
+            ranked = [row for row in data["results"] if row.get("rerank_method")]
+            self.assertTrue(ranked)
+            recorded_keys = {tuple(doc.splitlines()[:2]) for doc in recorded}
+            for row in ranked:
+                self.assertIn(
+                    (row["class_name"], row["rerank_method"]["method_name"]),
+                    recorded_keys,
+                )
 
     def test_vector_status_rejects_model_mismatch(self) -> None:
         _report, store = self._build(full=True)

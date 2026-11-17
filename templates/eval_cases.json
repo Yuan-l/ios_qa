@@ -1,6 +1,8 @@
 {
   "version": 1,
   "description": "模型无关的 golden 用例：直接验证查询层返回的类、文件、行号。任何 MCP 客户端都应得到同样的底层结果。",
+  "template_id": "",
+  "template_id_help": "构建向量索引后从 .ios_qa/qdrant_storage/build_meta.json 抄过来；不一致时向量类用例会转为「待复核」而不是判红。",
   "cases": [
     {
       "id": "feature-network",
@@ -17,6 +19,29 @@
       ],
       "reason": "中文双词检索能归并到网络门面",
       "last_reviewed": "2026-01-01"
+    },
+    {
+      "id": "vector-snippet-self",
+      "type": "search_similar_snippet",
+      "requires": "vectors",
+      "args": {
+        "class_name": "YourViewController",
+        "method_name": "viewDidLoad",
+        "limit": 5,
+        "min_similarity": 0.0
+      },
+      "checks": [
+        {
+          "kind": "vector_available"
+        },
+        {
+          "kind": "vector_top",
+          "value": "YourViewController.viewDidLoad",
+          "min_margin": 0.05
+        }
+      ],
+      "reason": "代码片段查自身：只断言首选是自己且与第二名有间隔，不断言模型相关的绝对分数",
+      "last_reviewed": "2026-11-18"
     }
   ]
 }

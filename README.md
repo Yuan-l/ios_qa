@@ -156,6 +156,7 @@ IOS_QA_ROOT=~/work/AppA python3 -m ios_qa build
 | `mcp` | 启动 MCP stdio server |
 | `mcp-smoke` | 双 MCP 客户端验收（协议层 + 数据层），`--client raw/sdk/both`、`--only` |
 | `eval` | 跑 `eval_cases.json` 的 golden 用例，断言类/文件/行号/接口路径 |
+| `calibrate` | 用方法体自身标定相似度阈值（当前模型 + 当前索引文本），输出 `min_score` / `min_margin` 建议 |
 | `doctor` | 索引自检 |
 
 示例输出（`trace`）：
@@ -653,8 +654,9 @@ python3 -m ios_qa hybrid "网络请求失败怎么重试" --no-rerank   # 只看
 
 实测本工程：1946 个有方法体的方法 → 1522 个可向量化。Qwen3-INT8 冷启动全量
 `vectors` 约 78 分钟（CPU，`EMBED_BATCH=32`，模型已缓存；一次性成本）。之后
-增量索引只重算变更文件，2~4 秒；但改了注释或 `.ios_qa/synonyms.json` 会让
-对应方法的索引文本变化，需要重新嵌入（本次加注释/标签时全量重建约 33 分钟）。
+增量索引只重算变更文件，2~4 秒。**改注释或 `.ios_qa/synonyms.json` 会让索引
+文本变化**：`template_id` 检测到契约变更后自动转全量重算（文本没变的走
+embedding 缓存，实测 1522 个方法 6.7 秒），不会静默留着旧向量。
 同一进程内 embedding / reranker 只加载一次；命中 `embedding_cache` 与
 `rerank_cache` 的查询 0.02s，未命中时首次精排约 20s。只想快速重建时用
 `IOS_QA_EMBED_PROFILE=bge-small-zh`，冷启动全量约 3 秒。
@@ -800,10 +802,14 @@ python3 -m ios_qa build --check
 | `candidate_modules` | `candidates` 覆盖 `values` 里的全部模块 |
 | `all_methods_module` | `methods` 全部来自指定模块 |
 | `similar_found` | `similar` 找到了目标方法的指纹 |
-| `similar_top` / `similar_contains` | 相似结果首条 / 任意一条是 `value`，且 `similarity` ≥ `min_similarity` |
+| `similar_top` / `similar_contains` | 相似结果首条 / 任意一条是 `value`，且 `similarity` ≥ `min_similarity`，可选 `min_margin` |
 | `duplicate_group` | 某一重复组覆盖 `members` 全部类.方法，且 `similarity` ≥ `min_similarity` |
 | `vector_available` | 语义索引可用（未构建时整条用例按 `requires` 跳过） |
-| `vector_top` / `vector_contains` | 首条 / 任意一条结果是 `value`，且 `score` ≥ `min_score` |
+| `vector_top` / `vector_contains` | 首条 / 任意一条结果是 `value`，且 `score` ≥ `min_score`，可选 `min_margin` |
+
+`min_margin` 是 `top1 − top2` 的下限。**向量类断言优先用它**：余弦相似度是
+相对量，换模型、改索引文本模板都会让绝对值整体平移（实测同为「方法体查自身」，
+在不同方法上落在 0.75~0.98），钉死绝对分数等于把实现细节写进验收。
 
 ### 维护策略
 
@@ -819,6 +825,34 @@ eval 失败
   ├─ 源码该位置没变  → 解析器回归，修代码
   └─ 源码确实重构了  → 人工确认后更新用例，并刷新 last_reviewed
 ```
+
+### 索引文本契约（template_id）
+
+`build_meta.json` 记录 `template_id`——模型 + 三个文本模板（document / query /
+snippet）+ 两个截断长度的指纹。把它抄进 `eval_cases.json` 顶层，两者不一致时
+**向量类用例转为「待复核」（⚠️，退出码 4）而不是判红**：
+
+```
+索引契约变了（换模型 / 改模板）→ 用例待复核 → 人工确认分数与排序 → 更新用例 + template_id
+```
+
+这一步是必需的：相似度是相对量，模板一改刻度就平移；自动判红会让人误以为解析器
+回归，自动判绿会掩盖真实的检索退化。构建侧同样认这个指纹——**模板变了即使源码
+没变也会强制全量重算**（`file_hashes.json` 里存了 `template_id`），否则增量构建
+会按文件 sha256 认为「全都跳过」，索引里留着一批旧模板的向量。
+
+阈值用 `calibrate` 标定，不靠手拍：
+
+```bash
+python3 -m ios_qa calibrate --samples 30
+# 相似度标定  30 个方法（不同类各取一个）  template_id=168b2cee98f3
+#   自身    min=0.753 p05=0.79 p50=0.919 max=0.976
+#   第二名  min=0.581 p50=0.73 max=0.916
+#   间隔    min=0.038 p05=0.06 p50=0.175 max=0.302
+# 建议: min_score=0.77  min_margin=0.05
+```
+
+注意「第二名 max=0.916」这类数字：绝对阈值挡不住它，只有 `min_margin` 能。
 
 ### 与参考文档的对应关系
 

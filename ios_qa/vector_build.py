@@ -36,6 +36,7 @@ from .embedding import (
     EmbeddingUnavailable,
     SparseEmbedder,
     document_text,
+    template_id,
 )
 from .vector_store import DENSE_VECTOR, SPARSE_VECTOR, VectorStore, point_id
 from .synonyms import load_groups, match_tags
@@ -53,6 +54,7 @@ class VectorBuildReport:
     model: str = EMBED_MODEL
     sparse_model: str = SPARSE_MODEL
     dim: int = EMBED_DIM
+    template_id: str = ""
     methods_total: int = 0
     methods_selected: int = 0
     points_written: int = 0
@@ -74,6 +76,7 @@ class VectorBuildReport:
             "model": self.model,
             "sparse_model": self.sparse_model,
             "dim": self.dim,
+            "template_id": self.template_id,
             "methods_total": self.methods_total,
             "methods_selected": self.methods_selected,
             "points_written": self.points_written,
@@ -198,14 +201,19 @@ def build_vectors(
         same_model = (
             previous.get("model") == model_name and previous.get("dim") == store.dim
         )
+        contract = template_id()
+        same_template = previous.get("template_id") == contract
+        report.template_id = contract
         try:
-            recreate = full or not same_model
+            # 文本模板变了，旧向量在语义上已经作废：增量构建按文件 sha256 判断
+            # 「没变就跳过」，不看模板，所以必须在这里强制全量重算。
+            recreate = full or not same_model or not same_template
             if recreate:
                 store.ensure_collection(recreate=store.collection_exists())
             else:
                 store.ensure_collection()
 
-            if full or not same_model or not previous:
+            if recreate or not previous:
                 changed = set(current_files)
                 deleted: set[str] = set()
                 report.mode = "full"
@@ -282,6 +290,7 @@ def build_vectors(
                 "model": report.model,
                 "sparse_model": report.sparse_model,
                 "dim": report.dim,
+                "template_id": contract,
                 "collection": "methods",
                 "elapsed_seconds": round(elapsed, 2),
             }
@@ -293,6 +302,7 @@ def build_vectors(
                     {
                         "model": report.model,
                         "dim": report.dim,
+                        "template_id": contract,
                         "built_at": meta["build_time"],
                         "files": current_files,
                     },

@@ -92,20 +92,30 @@ def _print_eval_report(report: dict, detailed: bool = True) -> None:
     for item in report["cases"]:
         if not detailed and item["ok"]:
             continue
-        mark = "⏭" if item.get("skipped") else ("✅" if item["ok"] else "❌")
+        if item.get("needs_review"):
+            mark = "⚠️"
+        else:
+            mark = "⏭" if item.get("skipped") else ("✅" if item["ok"] else "❌")
         reviewed = f"  [复核 {item['last_reviewed']}]" if item["last_reviewed"] else ""
         print(f"{mark} {item['id']}  ({item['type']}){reviewed}")
         if item["reason"]:
             print(f"   {item['reason']}")
         if item.get("skipped"):
             print(f"   - 跳过：{item.get('skip_reason', '')}")
+        if item.get("needs_review"):
+            print(f"   - 待复核：{item.get('review_reason', '')}")
+            continue
         for check in item["checks"]:
             if not check["ok"] or not item["ok"]:
                 print(f"   - {'ok' if check['ok'] else 'FAIL'} {check['kind']}: {check['detail']}")
     summary = f"\n通过 {report['passed']}/{report['total']}，失败 {report['failed']}"
     if report.get("skipped"):
         summary += f"，跳过 {report['skipped']}（需要向量索引）"
+    if report.get("needs_review"):
+        summary += f"，待复核 {report['needs_review']}（索引文本契约已变更）"
     print(summary)
+    if report.get("template_warning"):
+        print(f"提示: {report['template_warning']}")
 
 
 def cmd_build(args) -> int:
@@ -707,6 +717,8 @@ def cmd_vectors(args) -> int:
     print(f"  目录: {report.vector_dir}  collection={report.collection}")
     print(f"  模型: {report.model} / {report.dim} 维"
           f"  稀疏: {report.sparse_model}")
+    if report.template_id:
+        print(f"  文本契约: template_id={report.template_id}")
     print(f"  方法: {report.methods_total} 个候选 / {report.methods_selected} 个可向量化")
     print(f"  写入: points={report.points_written}  "
           f"dense: embedded={report.embedded} cached={report.cached}  "
@@ -759,6 +771,15 @@ def cmd_mcp(args) -> int:
     return 0
 
 
+def _eval_exit_code(report: dict) -> int:
+    """0 全绿；1 有用例失败；4 有用例待人工复核（索引文本契约变更）。"""
+    if report.get("failed"):
+        return 1
+    if report.get("needs_review"):
+        return 4
+    return 0
+
+
 def cmd_eval(args) -> int:
     profile = _profile(args)
     db_path = Path(args.db) if args.db else profile.resolved_db_path
@@ -775,10 +796,48 @@ def cmd_eval(args) -> int:
         return 2
     if args.json:
         _dump(report)
-        return 0 if report["failed"] == 0 else 1
+        return _eval_exit_code(report)
 
     _print_eval_report(report)
-    return 0 if report["failed"] == 0 else 1
+    return _eval_exit_code(report)
+
+
+def cmd_calibrate(args) -> int:
+    from .calibrate import calibrate
+
+    profile = _profile(args)
+    db_path = Path(args.db) if args.db else profile.resolved_db_path
+    if not db_path.exists():
+        print(f"索引不存在: {db_path}\n先运行 python3 -m ios_qa build")
+        return 2
+    report = calibrate(profile, db_path, samples=args.samples)
+    if args.json:
+        _dump(report)
+        return 0 if report.get("available") else 2
+    if not report.get("available"):
+        print(f"向量索引不可用：{report.get('hint', '')}")
+        return 2
+    stats = report["stats"]
+    suggested = report["suggested"]
+    print(
+        f"相似度标定  {stats['count']} 个方法（不同类各取一个）  "
+        f"template_id={report['template_id']}"
+    )
+    print(f"  模型: {report['model']}")
+    print(f"  自身    min={stats['self']['min']} p05={stats['self']['p05']} "
+          f"p50={stats['self']['p50']} max={stats['self']['max']}")
+    print(f"  第二名  min={stats['second']['min']} p50={stats['second']['p50']} "
+          f"max={stats['second']['max']}")
+    print(f"  间隔    min={stats['margin']['min']} p05={stats['margin']['p05']} "
+          f"p50={stats['margin']['p50']} max={stats['margin']['max']}")
+    if stats["self_misses"]:
+        print(f"  ⚠️ 有 {stats['self_misses']} 个方法的首选不是自己（查询链路需要排查）")
+    print(
+        f"\n建议: min_score={suggested['min_score']}  "
+        f"min_margin={suggested['min_margin']}"
+    )
+    print("  用例里优先断言 min_margin：绝对值随模型/模板平移，间隔才是区分力。")
+    return 0
 
 
 def cmd_mcp_smoke(args) -> int:
@@ -1016,6 +1075,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cases", default=None, help="用例 JSON（默认 <root>/.ios_qa/eval_cases.json）")
     p.add_argument("--only", default="", help="只跑指定 id，逗号分隔")
     p.set_defaults(func=cmd_eval)
+
+    p = sub.add_parser(
+        "calibrate", parents=[common],
+        help="用方法体自身标定相似度阈值（当前模型 + 当前索引文本）",
+    )
+    p.add_argument("--samples", type=int, default=30, help="抽样方法数（默认 30）")
+    p.set_defaults(func=cmd_calibrate)
 
     p = sub.add_parser(
         "mcp-smoke", parents=[common],
