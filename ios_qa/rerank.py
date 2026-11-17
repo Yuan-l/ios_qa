@@ -2,9 +2,12 @@
 # -*- coding: utf-8 -*-
 """Cross-Encoder 精排（检索的第二阶段）。
 
-混合检索先用 FTS + 向量召回候选，这里再用 ``BAAI/bge-reranker-v2-m3``
-对 ``(问题, 类名+方法体)`` 逐对打分，按相关性重排 top-K。模型是多语言的，
-能直接处理「中文问题 ↔ Objective-C/Swift 代码」这种跨模态匹配。
+混合检索先用 FTS + 向量召回方法级候选，这里再用 ``BAAI/bge-reranker-v2-m3``
+对 ``(问题, 类名+方法名+注释+方法体)`` 逐对打分，按相关性重排 top-K。模型是
+多语言的，能直接处理「中文问题 ↔ Objective-C/Swift 代码」这种跨模态匹配。
+
+CPU 上每对约 0.7s，所以分数会缓存到 ``embedding_cache.db.rerank_cache``，
+同一问题重复问不再重复推理。
 
 默认用 INT8 版（约 0.57 GB），CPU 上比 fp32 快且精度损失很小。
 没装 ``fastembed`` 或缺模型文件时抛 :class:`RerankUnavailable`，调用方
@@ -14,15 +17,19 @@
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 
+from .embedding import EmbeddingCache, cache_key
+
 RERANK_MODEL = "BAAI/bge-reranker-v2-m3-int8"
-# 规则召回后送进 Cross-Encoder 的候选数：要覆盖向量第 20 名左右的方法
-# （例如「网络失败重试」的 TBFinanceHTTP，cosine 排名不高，但精排分最高）。
-RERANK_CANDIDATES = 20
-# 额外补进精排的向量 top 类：规则分低的语义正确项（如 cosine 第 22 的
-# TBFinanceHTTP.attemptGETAtIndex:...）也要让 Cross-Encoder 看到。
-VECTOR_RERANK_TOP = 30
+# 精排是方法级的：FTS 方法命中取前 30 个，再并上向量 top-40 的方法。
+# 不能只拿「类 + 向量最相近的方法」去精排——向量最近的方法可能是
+# tb_updateMonitorScreen 这类无关实现，会把真正干活的 loadQuotesForCategory:
+# 挤出榜单。候选太少还会漏掉 FTS 排 23、向量排 35 的
+# TBFinanceHTTP.attemptGETAtIndex:...（它精排分其实排第 2）。
+METHOD_RERANK_TOP = 30
+VECTOR_RERANK_TOP = 40
 
 INSTALL_HINT = (
     "精排依赖未安装：python3 -m pip install fastembed\n"
@@ -46,11 +53,13 @@ def sigmoid(value: float) -> float:
 class CrossEncoderReranker:
     def __init__(
         self,
-        model: str = RERANK_MODEL,
+        model: str | None = None,
         cache_dir: str | Path | None = None,
+        cache: EmbeddingCache | None = None,
     ) -> None:
-        self.model = model
+        self.model = model or os.environ.get("IOS_QA_RERANK_MODEL") or RERANK_MODEL
         self.cache_dir = cache_dir
+        self.cache = cache
         self._model = None
 
     def _load(self):
@@ -72,8 +81,29 @@ class CrossEncoderReranker:
         return self._model
 
     def scores(self, query: str, documents: list[str]) -> list[float]:
-        """返回与 ``documents`` 等长的相关性分数（已 sigmoid 到 0-1）。"""
+        """返回与 ``documents`` 等长的相关性分数（已 sigmoid 到 0-1）。
+
+        CPU 上每对约 0.7s，所以按 ``(model, query, document)`` 缓存到
+        ``embedding_cache.db.rerank_cache``：同一问题重复问、或者 eval 重跑时
+        不再重复推理；文档（方法体/注释）变了 key 自然失效。
+        """
         if not documents:
             return []
-        model = self._load()
-        return [sigmoid(float(value)) for value in model.rerank(query, documents)]
+        keys = [cache_key(self.model, f"{query}\x1f{document}") for document in documents]
+        cached = self.cache.get_rerank(keys) if self.cache is not None else {}
+        missing = [
+            (key, document)
+            for key, document in zip(keys, documents)
+            if key not in cached
+        ]
+        if missing:
+            model = self._load()
+            fresh: list[tuple[str, float]] = []
+            pairs = [(query, document) for _, document in missing]
+            for (key, _), value in zip(missing, model.rerank_pairs(pairs)):
+                score = sigmoid(float(value))
+                cached[key] = score
+                fresh.append((key, score))
+            if self.cache is not None:
+                self.cache.put_rerank(fresh)
+        return [cached[key] for key in keys]

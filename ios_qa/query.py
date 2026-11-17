@@ -23,12 +23,13 @@ from .embedding import (
     EmbeddingCache,
     EmbeddingUnavailable,
     SparseEmbedder,
+    clean_comment,
     query_text,
     snippet_text,
 )
 from .fingerprint import band_keys, decode_shingles, jaccard
 from .rerank import (
-    RERANK_CANDIDATES,
+    METHOD_RERANK_TOP,
     VECTOR_RERANK_TOP,
     CrossEncoderReranker,
     RerankUnavailable,
@@ -451,9 +452,10 @@ class QueryService:
         这里保留 FTS 的强弱（``score / 100``），否则弱 OR 命中会和精确命中
         同分，把语义结果挤出榜单。
 
-        ``rerank=True`` 时对规则召回的前 20 个候选做 Cross-Encoder 精排：
-        top-K 的顺序由 reranker 决定，规则分保留在 ``rule_score``；模型不可用时
-        静默回退到规则排序。
+        ``rerank=True`` 时做方法级精排：规则分不变，FTS 方法命中 + 向量近邻
+        组成候选，``(问题, 类+方法+注释+方法体)`` 逐对打分；同类的多条方法取
+        最高分作为该类代表，top-K 顺序由 reranker 决定，规则分保留在
+        ``rule_score``。模型不可用时静默回退到规则排序。
         """
         query = (query or "").strip()
         limit = max(1, min(int(limit), 50))
@@ -539,34 +541,44 @@ class QueryService:
 
         rerank_hint = ""
         if rerank and ordered:
-            by_name = {row["class_name"]: row for row in ordered}
-            head = ordered[:RERANK_CANDIDATES]
-            chosen = {row["class_name"] for row in head}
-            for hit in vector_hits[:VECTOR_RERANK_TOP]:
-                row = by_name.get(hit["class_name"])
-                if row is not None and row["class_name"] not in chosen:
-                    head.append(row)
-                    chosen.add(row["class_name"])
-            documents = [self._rerank_document(row) for row in head]
-            try:
-                ce_scores = self._rerank_model().scores(query, documents)
-            except RerankUnavailable as exc:
-                ce_scores = []
-                rerank_hint = str(exc)
-            if ce_scores:
-                for row, ce in zip(head, ce_scores):
-                    row["rerank_score"] = round(ce, 4)
-                    row["score"] = row["rerank_score"]
-                # 规则只负责召回；候选内部由 Cross-Encoder 决定顺序。
-                head.sort(
-                    key=lambda row: (
-                        -row["rerank_score"],
-                        -row["rule_score"],
-                        row["class_name"],
+            pairs = self._rerank_pairs(query, vector_hits, module)
+            if pairs:
+                documents = [self._rerank_document(pair) for pair in pairs]
+                try:
+                    ce_scores = self._rerank_model().scores(query, documents)
+                except RerankUnavailable as exc:
+                    ce_scores = []
+                    rerank_hint = str(exc)
+                if ce_scores:
+                    # 同一个类可能有多条方法候选，取精排分最高的那条作为代表。
+                    best: dict[str, tuple[float, dict]] = {}
+                    for pair, ce in zip(pairs, ce_scores):
+                        current = best.get(pair["class_name"])
+                        if current is None or ce > current[0]:
+                            best[pair["class_name"]] = (ce, pair)
+                    for row in ordered:
+                        hit = best.get(row["class_name"])
+                        if hit is None:
+                            continue
+                        ce, pair = hit
+                        row["rerank_score"] = round(ce, 4)
+                        row["score"] = row["rerank_score"]
+                        row["rerank_method"] = {
+                            "method_name": pair["method_name"],
+                            "file_path": pair["file_path"],
+                            "line_start": pair["line_start"],
+                        }
+                    # 规则只负责召回；类内顺序由 Cross-Encoder 决定。
+                    ranked = [row for row in ordered if "rerank_score" in row]
+                    rest = [row for row in ordered if "rerank_score" not in row]
+                    ranked.sort(
+                        key=lambda row: (
+                            -row["rerank_score"],
+                            -row["rule_score"],
+                            row["class_name"],
+                        )
                     )
-                )
-                rest = [row for row in ordered if row["class_name"] not in chosen]
-                ordered = head + rest
+                    ordered = ranked + rest
 
         top = ordered[:limit]
         return {
@@ -585,35 +597,70 @@ class QueryService:
 
     def _rerank_model(self) -> CrossEncoderReranker:
         if self._reranker is None:
-            self._reranker = CrossEncoderReranker()
+            self._reranker = CrossEncoderReranker(cache=self._cache())
         return self._reranker
 
-    def _rerank_document(self, row: dict) -> str:
-        """精排输入：类名 + 最相近方法名 + 方法体（没有方法体时退回方法列表）。"""
-        parts = [row["class_name"]]
-        method = row.get("vector_method") or {}
-        body = ""
-        if method.get("method_name"):
-            parts.append(method["method_name"])
-            body = self._method_body(
-                method.get("file_path", ""),
-                int(method.get("line_start") or 0),
-                method["method_name"],
+    def _method_hits(self, query: str, limit: int = 30) -> list[dict]:
+        """FTS 方法级命中（AND 优先，退化到 OR），供 Cross-Encoder 精排。"""
+        for op in ("AND", "OR"):
+            expr = fts_expr(query, op)
+            if not expr:
+                return []
+            rows = self.conn.execute(
+                "SELECT m.class_name, m.method_name, m.module, m.file_path, "
+                "m.line_start FROM methods_fts f JOIN methods m ON m.id = f.rowid "
+                "WHERE methods_fts MATCH ? AND m.has_body = 1 "
+                "ORDER BY bm25(methods_fts) LIMIT ?",
+                (expr, limit),
+            ).fetchall()
+            if rows:
+                return [dict(row) for row in rows]
+        return []
+
+    def _rerank_pairs(
+        self, query: str, vector_hits: list[dict], module: str = ""
+    ) -> list[dict]:
+        """方法级精排候选：FTS 方法命中 + 向量近邻，按 (类, 方法) 去重。"""
+        pairs: list[dict] = []
+        seen: set[tuple[str, str]] = set()
+
+        def add(hit: dict) -> None:
+            class_name = hit.get("class_name") or ""
+            method_name = hit.get("method_name") or ""
+            if not class_name or not method_name:
+                return
+            if module and hit.get("module") and hit["module"] != module:
+                return
+            key = (class_name, method_name)
+            if key in seen:
+                return
+            seen.add(key)
+            pairs.append(
+                {
+                    "class_name": class_name,
+                    "method_name": method_name,
+                    "file_path": hit.get("file_path") or "",
+                    "line_start": int(hit.get("line_start") or 0),
+                }
             )
+
+        for hit in self._method_hits(query, METHOD_RERANK_TOP):
+            add(hit)
+        for hit in vector_hits[:VECTOR_RERANK_TOP]:
+            add(hit)
+        return pairs
+
+    def _rerank_document(self, pair: dict) -> str:
+        """精排输入：类名 + 方法名 + 文档注释 + 方法体。"""
+        parts = [pair["class_name"], pair["method_name"]]
+        body, comment = self._method_record(
+            pair["file_path"], pair["line_start"], pair["method_name"]
+        )
+        comment = clean_comment(comment)
+        if comment:
+            parts.append(comment)
         if body:
             parts.append(body[:1200])
-        else:
-            names = [item.get("method_name", "") for item in row.get("methods") or []]
-            parts.extend(name for name in names if name)
-            if names:
-                first = row["methods"][0]
-                body = self._method_body(
-                    first.get("file_path", ""),
-                    int(first.get("line_start") or 0),
-                    first.get("method_name", ""),
-                )
-                if body:
-                    parts.append(body[:1200])
         return "\n".join(parts)
 
     def search_symbol(self, name: str, limit: int = 10) -> dict:
@@ -1735,12 +1782,21 @@ class QueryService:
             return False, f"向量库不可用：{exc}"
         return True, ""
 
-    def _method_body(self, file_path: str, line_start: int, method_name: str) -> str:
+    def _method_record(
+        self, file_path: str, line_start: int, method_name: str
+    ) -> tuple[str, str]:
+        """返回 ``(body, doc_comment)``；精排需要注释里的业务说明。"""
         row = self.conn.execute(
-            "SELECT body FROM methods WHERE file_path=? AND line_start=? AND method_name=?",
+            "SELECT body, doc_comment FROM methods "
+            "WHERE file_path=? AND line_start=? AND method_name=?",
             (file_path, line_start, method_name),
         ).fetchone()
-        return row["body"] if row else ""
+        if not row:
+            return "", ""
+        return row["body"] or "", row["doc_comment"] or ""
+
+    def _method_body(self, file_path: str, line_start: int, method_name: str) -> str:
+        return self._method_record(file_path, line_start, method_name)[0]
 
     def _read_source_range(self, file_path: str, start: int, end: int) -> str:
         path, _ = self._resolve_path(file_path)
@@ -1873,9 +1929,14 @@ class QueryService:
         code: str,
         limit: int = 5,
         module: str = "",
-        min_similarity: float = 0.90,
+        min_similarity: float = 0.75,
     ) -> dict:
-        """任意代码片段找项目里语义相近的方法（参考方案同名的 Tool 11）。"""
+        """任意代码片段找项目里语义相近的方法（参考方案同名的 Tool 11）。
+
+        索引文本除了方法体，还带类/方法名、同义词标签与文档注释，所以
+        「方法体查自己」的相似度在 0.80 左右（不是 1.0）；默认阈值 0.75 既能
+        命中自身，也能把第二名（约 0.70）挡在外面。
+        """
         code = (code or "").strip()
         limit = max(1, min(int(limit), 50))
         base = {

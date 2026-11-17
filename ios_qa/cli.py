@@ -201,6 +201,12 @@ def cmd_hybrid(args) -> int:
         method = item.get("vector_method") or {}
         if method.get("method_name"):
             print(f"   语义最相近: {method['method_name']} ({method['score']})")
+        reranked = item.get("rerank_method") or {}
+        if reranked.get("method_name"):
+            print(
+                f"   精排命中: {reranked['method_name']} "
+                f"(rerank={item.get('rerank_score')}, 规则分={item['rule_score']})"
+            )
         methods = [m.get("method_name", "") for m in item.get("methods") or []][:5]
         if methods:
             print(f"   方法: {', '.join(methods)}")
@@ -966,7 +972,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--module", default="")
     p.add_argument("--limit", type=int, default=5)
     p.add_argument(
-        "--min-similarity", dest="min_similarity", type=float, default=0.90
+        "--min-similarity", dest="min_similarity", type=float, default=0.75
     )
     p.set_defaults(func=cmd_similar_snippet)
 

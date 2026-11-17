@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""向量索引构建：``methods`` collection（dense BGE + sparse BM42）。
+"""向量索引构建：``methods`` collection（dense 默认 Qwen3 + sparse BM42）。
 
 对应参考方案的 ``build_vector_index.py``：
 
 1. 从 ``methods`` 表取方法体，跳过 <3 行或 <80 字符的短方法；
 2. ``point_id = MD5(file_path:method_name)[:16]`` 去重，保证幂等 upsert；
-3. 文本 ``search_document: 类:{class} 方法:{method}\\n{body[:2000]}``，
-   经 ``embedding_cache.db`` 缓存后只算新增/变更的方法；
+3. 文本 ``类:{class} 方法:{method}\n业务标签:{synonyms}\n{comment}\n{body[:2000]}``，
+   同义词标签与文档注释让中文问题命中英文命名的实现；
 4. 写入 Qdrant ``methods``（dense 余弦 + sparse BM42）；
 5. ``build_meta.json`` 记录 git / model / method_count / 耗时；
 6. ``file_hashes.json`` 记录源文件 SHA256，下次只重算变更文件。
@@ -38,6 +38,7 @@ from .embedding import (
     document_text,
 )
 from .vector_store import DENSE_VECTOR, SPARSE_VECTOR, VectorStore, point_id
+from .synonyms import load_groups, match_tags
 
 VECTOR_DIR_NAME = "qdrant_storage"
 META_FILE = "build_meta.json"
@@ -115,7 +116,7 @@ def _now() -> str:
 def _select_methods(conn: sqlite3.Connection, files: set[str] | None = None) -> list[sqlite3.Row]:
     sql = (
         "SELECT class_name, method_name, module, language, file_path, "
-        "line_start, line_end, body FROM methods WHERE has_body = 1"
+        "line_start, line_end, body, doc_comment FROM methods WHERE has_body = 1"
     )
     params: list[Any] = []
     if files is not None:
@@ -131,6 +132,25 @@ def _eligible(row: sqlite3.Row) -> bool:
     body = row["body"] or ""
     lines = (row["line_end"] or row["line_start"] or 0) - (row["line_start"] or 0) + 1
     return len(body.strip()) >= MIN_BODY_CHARS and lines >= MIN_BODY_LINES
+
+
+def method_document(row: Any, groups: list[list[str]]) -> str:
+    """索引文本：类/方法 + 同义词标签 + 文档注释 + 方法体。"""
+    tag_source = " ".join(
+        (
+            row["class_name"] or "",
+            row["method_name"] or "",
+            row["module"] or "",
+            row["doc_comment"] or "",
+        )
+    )
+    return document_text(
+        row["class_name"],
+        row["method_name"],
+        row["body"] or "",
+        comment=row["doc_comment"] or "",
+        tags=match_tags(tag_source, groups),
+    )
 
 
 def build_vectors(
@@ -215,12 +235,8 @@ def build_vectors(
             report.methods_selected = len(picked)
 
             if picked:
-                texts = [
-                    document_text(
-                        row["class_name"], row["method_name"], row["body"] or ""
-                    )
-                    for _, row in picked
-                ]
+                groups = load_groups(profile)
+                texts = [method_document(row, groups) for _, row in picked]
                 dense_vectors, dense_cached = dense.embed_documents(texts)
                 report.cached += dense_cached
                 report.embedded += len(texts) - dense_cached

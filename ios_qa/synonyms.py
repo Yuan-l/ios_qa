@@ -17,6 +17,9 @@ from pathlib import Path
 from .config import CONFIG_DIR_NAME, ProjectProfile
 
 MAX_EXPANSIONS = 8
+# 索引期标签：一个方法最多带 3 组同义词、12 个词，避免标签压过方法体。
+TAG_GROUP_LIMIT = 3
+TAG_TERM_LIMIT = 12
 
 
 def _candidate_paths(profile: ProjectProfile | None) -> list[Path]:
@@ -43,6 +46,38 @@ def load_groups(profile: ProjectProfile | None = None) -> list[list[str]]:
             if isinstance(group, list) and len(group) > 1
         ]
     return []
+
+
+def match_tags(
+    text: str,
+    groups: list[list[str]],
+    max_groups: int = TAG_GROUP_LIMIT,
+    max_terms: int = TAG_TERM_LIMIT,
+) -> list[str]:
+    """索引期同义词标签：文本命中某组任一词时，返回该组里**尚未出现**的词。
+
+    和查询期扩展互补：查询期扩展依赖查询里出现别名，这里把别名写进方法向量，
+    让「崩溃 / 卡顿 / 行情」这类中文词能命中英文命名的类（``TBCrashReporter``、
+    ``TDHangWatchdog``），即使问题里没有代码字面量。
+    """
+    lowered = (text or "").lower()
+    if not lowered or not groups:
+        return []
+    tags: list[str] = []
+    matched = 0
+    for group in groups:
+        if not any(term and term.lower() in lowered for term in group):
+            continue
+        matched += 1
+        for term in group:
+            if term.lower() in lowered or term in tags:
+                continue
+            tags.append(term)
+            if len(tags) >= max_terms:
+                return tags
+        if matched >= max_groups:
+            break
+    return tags
 
 
 def expand_query(

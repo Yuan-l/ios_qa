@@ -86,8 +86,10 @@ def hybrid_find_feature(
     """FTS + 向量混合检索：精确词命中优先，语义相近的实现补位。
 
     结果按类去重，``sources`` 标明来自 ``fts`` / ``vector``，
-    ``vector_method`` 给出该类下语义最接近的方法。默认用 Cross-Encoder
-    精排前 8 个候选；``rerank=False`` 只看规则排序。
+    ``vector_method`` 给出该类下语义最接近的方法；默认对方法级候选做
+    Cross-Encoder 精排，``rerank_method`` 是真正被精排选中的方法，
+    ``score`` 是精排概率、``rule_score`` 保留规则分。
+    ``rerank=False`` 只看规则排序（快，适合批量扫）。
     """
     with _service() as service:
         return _dump(
@@ -211,9 +213,13 @@ def vector_search(query: str, limit: int = 5, module: str = "") -> str:
 
 @mcp.tool()
 def search_similar_snippet(
-    code: str, limit: int = 5, module: str = "", min_similarity: float = 0.90
+    code: str, limit: int = 5, module: str = "", min_similarity: float = 0.75
 ) -> str:
-    """任意代码片段找项目里语义相近的方法（返回 source_code 与复用建议）。"""
+    """任意代码片段找项目里语义相近的方法（返回 source_code 与复用建议）。
+
+    索引文本含类/方法名、注释与同义词标签，方法体查自身的相似度约 0.80，
+    所以默认阈值是 0.75。
+    """
     with _service() as service:
         return _dump(
             service.search_similar_snippet(

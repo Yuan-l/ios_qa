@@ -34,6 +34,9 @@ DEFAULT_PROFILE = "qwen3-0.6b"
 SPARSE_MODEL = "Qdrant/bm42-all-minilm-l6-v2-attentions"
 
 BODY_LIMIT = 2000
+# 声明前的文档注释通常是一句业务说明（中文居多），对「问题里没有代码字面量」
+# 的检索帮助最大，但要截断，避免复制粘贴的大段注释稀释方法体。
+COMMENT_LIMIT = 300
 MIN_BODY_CHARS = 80
 MIN_BODY_LINES = 3
 
@@ -58,6 +61,20 @@ QUERY_INSTRUCTION = (
     "Objective-C or Swift method whose implementation answers it"
 )
 
+# 这些注释是分隔符/待办，放进 embedding 只会稀释方法体语义。
+_COMMENT_NOISE = ("MARK:", "PRAGMA MARK", "FIXME:")
+
+
+def clean_comment(text: str) -> str:
+    """把声明前的注释压成一行可检索文本，丢掉 ``MARK:`` 之类的分隔注释。"""
+    lines = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line.upper().startswith(_COMMENT_NOISE):
+            continue
+        lines.append(line)
+    return " ".join(lines)[:COMMENT_LIMIT]
+
 
 @dataclass(frozen=True)
 class EmbeddingProfile:
@@ -70,10 +87,21 @@ class EmbeddingProfile:
     query: str
     snippet: str
 
-    def document_text(self, class_name: str, method_name: str, body: str) -> str:
+    def document_text(
+        self,
+        class_name: str,
+        method_name: str,
+        body: str,
+        comment: str = "",
+        tags: list[str] | None = None,
+    ) -> str:
+        tag_text = f"\n业务标签:{' '.join(tags)}" if tags else ""
+        comment = clean_comment(comment)
         return self.document.format(
             class_name=class_name,
             method_name=method_name,
+            tags=tag_text,
+            comment=f"{comment}\n" if comment else "",
             body=(body or "")[:BODY_LIMIT],
         )
 
@@ -91,7 +119,7 @@ PROFILES: dict[str, EmbeddingProfile] = {
         name="qwen3-0.6b",
         model="Qwen/Qwen3-Embedding-0.6B-Q",
         dim=1024,
-        document="类:{class_name} 方法:{method_name}\n{body}",
+        document="类:{class_name} 方法:{method_name}{tags}\n{comment}{body}",
         query="Instruct: {instruction}\nQuery: {query}",
         snippet="{code}",
     ),
@@ -99,7 +127,7 @@ PROFILES: dict[str, EmbeddingProfile] = {
         name="bge-small-zh",
         model="BAAI/bge-small-zh-v1.5",
         dim=512,
-        document="search_document: 类:{class_name} 方法:{method_name}\n{body}",
+        document="search_document: 类:{class_name} 方法:{method_name}{tags}\n{comment}{body}",
         query="search_query: {query}",
         snippet="search_document: {code}",
     ),
@@ -107,7 +135,7 @@ PROFILES: dict[str, EmbeddingProfile] = {
         name="jina-code",
         model="jinaai/jina-embeddings-v2-base-code",
         dim=768,
-        document="{class_name} {method_name}\n{body}",
+        document="{class_name} {method_name}{tags}\n{comment}{body}",
         query="{query}",
         snippet="{code}",
     ),
@@ -129,9 +157,17 @@ EMBED_MODEL = ACTIVE_PROFILE.model
 EMBED_DIM = ACTIVE_PROFILE.dim
 
 
-def document_text(class_name: str, method_name: str, body: str) -> str:
-    """索引侧文本：类/方法是精确词，必须进 embedding 输入。"""
-    return ACTIVE_PROFILE.document_text(class_name, method_name, body)
+def document_text(
+    class_name: str,
+    method_name: str,
+    body: str,
+    comment: str = "",
+    tags: list[str] | None = None,
+) -> str:
+    """索引侧文本：类/方法/业务标签/文档注释/方法体。"""
+    return ACTIVE_PROFILE.document_text(
+        class_name, method_name, body, comment=comment, tags=tags
+    )
 
 
 def query_text(query: str) -> str:
@@ -184,6 +220,10 @@ class EmbeddingCache:
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS sparse_cache ("
             "key TEXT PRIMARY KEY, indices BLOB, vals BLOB)"
+        )
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS rerank_cache ("
+            "key TEXT PRIMARY KEY, score REAL)"
         )
 
     def close(self) -> None:
@@ -243,6 +283,28 @@ class EmbeddingCache:
                 )
                 for key, vec in items
             ],
+        )
+        self.conn.commit()
+
+    # -- 精排 ----------------------------------------------------------
+    def get_rerank(self, keys: list[str]) -> dict[str, float]:
+        out: dict[str, float] = {}
+        for start in range(0, len(keys), CACHE_BATCH):
+            chunk = keys[start : start + CACHE_BATCH]
+            marks = ",".join("?" for _ in chunk)
+            rows = self.conn.execute(
+                f"SELECT key, score FROM rerank_cache WHERE key IN ({marks})", chunk
+            ).fetchall()
+            for key, score in rows:
+                out[key] = float(score)
+        return out
+
+    def put_rerank(self, items: list[tuple[str, float]]) -> None:
+        if not items:
+            return
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO rerank_cache(key, score) VALUES (?,?)",
+            [(key, float(score)) for key, score in items],
         )
         self.conn.commit()
 

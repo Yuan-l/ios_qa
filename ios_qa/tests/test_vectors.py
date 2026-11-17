@@ -33,7 +33,7 @@ from ios_qa.embedding import (
 )
 from ios_qa.fingerprint import code_tokens
 from ios_qa.query import QueryService
-from ios_qa.vector_build import build_vectors, read_meta, vector_dir
+from ios_qa.vector_build import build_vectors, method_document, read_meta, vector_dir
 from ios_qa.vector_store import VectorStore, point_id
 
 try:
@@ -92,7 +92,7 @@ class FakeSparseEmbedder:
 
 
 class FakeReranker:
-    def __init__(self, score: float = 0.9) -> None:
+    def __init__(self, score: float = 0.9, *args, cache=None, **kwargs) -> None:
         self.score = score
 
     def scores(self, query: str, documents: list[str]) -> list[float]:
@@ -128,6 +128,22 @@ class EmbeddingTextTest(unittest.TestCase):
         self.assertEqual(profile.query_text(" 行情 "), "search_query: 行情")
         self.assertTrue(profile.snippet_text("- (void)run {}").startswith("search_document: "))
 
+    def test_document_text_carries_tags_and_comment(self) -> None:
+        text = document_text(
+            "TBCrashReporter",
+            "handleException:",
+            "report();",
+            comment="MARK: - Actions\n崩溃上报入口",
+            tags=["崩溃", "crash"],
+        )
+        self.assertIn("业务标签:崩溃 crash", text)
+        self.assertIn("崩溃上报入口", text)
+        self.assertNotIn("MARK:", text)
+
+    def test_empty_comment_and_tags_keep_prefix_clean(self) -> None:
+        text = document_text("TBAlphaView", "loadData", "body")
+        self.assertEqual(text, "类:TBAlphaView 方法:loadData\nbody")
+
     def test_unknown_profile_rejected(self) -> None:
         with self.assertRaises(ValueError):
             get_profile("no-such-model")
@@ -161,6 +177,12 @@ class EmbeddingCacheTest(unittest.TestCase):
         self.assertNotIn("missing", dense)
         self.assertEqual(sparse["k2"].indices, [1, 4, 9])
         self.assertAlmostEqual(sparse["k2"].values[2], 0.5, places=5)
+
+    def test_rerank_cache_roundtrip(self) -> None:
+        with EmbeddingCache(self.path) as cache:
+            cache.put_rerank([("k1", 0.42)])
+        with EmbeddingCache(self.path) as cache:
+            self.assertEqual(cache.get_rerank(["k1", "missing"]), {"k1": 0.42})
 
 
 HEADER = """\
@@ -226,6 +248,32 @@ class VectorBuildTest(unittest.TestCase):
         finally:
             cache.close()
         return report, store
+
+    def test_method_document_uses_synonyms_and_comment(self) -> None:
+        groups = [["崩溃", "crash"], ["网络", "请求", "http", "api"]]
+        row = {
+            "class_name": "TBCrashReporter",
+            "method_name": "handleException:",
+            "module": "Monitor",
+            "doc_comment": "MARK: - Actions\nexception 上报入口",
+            "body": "report();",
+        }
+        text = method_document(row, groups)
+        self.assertIn("业务标签:崩溃", text)
+        self.assertNotIn("网络", text)
+        self.assertIn("exception 上报入口", text)
+        self.assertNotIn("MARK:", text)
+
+    def test_method_document_skips_tags_already_in_text(self) -> None:
+        groups = [["崩溃", "crash"]]
+        row = {
+            "class_name": "TBCrashReporter",
+            "method_name": "handleException:",
+            "module": "Monitor",
+            "doc_comment": "崩溃上报入口",
+            "body": "report();",
+        }
+        self.assertNotIn("业务标签", method_document(row, groups))
 
     def test_full_build_writes_points_and_meta(self) -> None:
         report, store = self._build(full=True)
@@ -360,7 +408,7 @@ class VectorBuildTest(unittest.TestCase):
                 self.assertTrue(row["vector_method"]["method_name"])
                 break
 
-    def test_hybrid_rerank_blends_scores(self) -> None:
+    def test_hybrid_rerank_sets_method_level_score(self) -> None:
         _report, store = self._build(full=True)
         store.close()
         with fake_vector_layer(), mock.patch(
@@ -368,10 +416,24 @@ class VectorBuildTest(unittest.TestCase):
         ), QueryService(self.profile, self.db_path) as service:
             data = service.hybrid_find_feature("load quotes category", limit=5)
         self.assertTrue(data["reranked"])
-        for row in data["results"]:
-            self.assertIn("rerank_score", row)
+        alpha = next(
+            row for row in data["results"] if row["class_name"] == "TBAlphaView"
+        )
+        self.assertEqual(alpha["rerank_method"]["method_name"], "loadQuotesForCategory:")
         scores = [row["score"] for row in data["results"]]
         self.assertEqual(scores, sorted(scores, reverse=True))
+
+    def test_rerank_pairs_dedupe_and_have_methods(self) -> None:
+        _report, store = self._build(full=True)
+        store.close()
+        with fake_vector_layer(), QueryService(self.profile, self.db_path) as service:
+            pairs = service._rerank_pairs("load quotes", [], "")
+            self.assertTrue(pairs)
+            keys = {(pair["class_name"], pair["method_name"]) for pair in pairs}
+            self.assertEqual(len(keys), len(pairs))
+            document = service._rerank_document(pairs[0])
+            self.assertIn(pairs[0]["class_name"], document)
+            self.assertIn(pairs[0]["method_name"], document)
 
     def test_vector_status_rejects_model_mismatch(self) -> None:
         _report, store = self._build(full=True)

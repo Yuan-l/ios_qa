@@ -149,7 +149,7 @@ IOS_QA_ROOT=~/work/AppA python3 -m ios_qa build
 | `similar <目标>` | 找相似方法；默认词法指纹（`--min-similarity` 0.3），`--mode semantic` 走 Qdrant |
 | `duplicates` | 重复代码聚类；`--min-lines`（默认 6）/ `--min-similarity`（默认 0.8）/ `--class` |
 | `semantic <查询>` | 自然语言语义检索方法体；`--module` / `--limit`（默认 5） |
-| `similar-snippet <文件>` | 任意代码片段找语义相近的方法；`--min-similarity`（默认 0.90） |
+| `similar-snippet <文件>` | 任意代码片段找语义相近的方法；`--min-similarity`（默认 0.75，索引文本含注释/标签后自相似约 0.80） |
 | `vectors` | 构建 Qdrant 向量索引；`--full` 重建 collection，`--limit` 调试 |
 | `module <名称>` | 模块概览 |
 | `qa save/search/delete` | 历史问答知识库 |
@@ -224,7 +224,7 @@ MCP 是协议，不绑定客户端：OpenCode、Cursor、Claude Code、自研 Ag
 |---|---|
 | `kb_info` | 索引健康信息 |
 | `find_feature` | 功能/页面检索（中文，纯词法） |
-| `hybrid_find_feature` | FTS + 向量混合找功能，按类合并；默认 Cross-Encoder 精排 top-8 |
+| `hybrid_find_feature` | FTS + 向量混合找功能，按类合并；默认方法级 Cross-Encoder 精排 |
 | `search_symbol` | 类名/方法名符号检索 |
 | `trace_class` | 类数据流全量视图；同名类返回 `ambiguous`/`candidates`，可传 `module` 消歧 |
 | `search_methods` | 方法体全文检索；方法名精确/包含命中优先于「方法体里提到」 |
@@ -524,16 +524,34 @@ $ python3 -m ios_qa duplicates --min-lines 10 --limit 1
 | collection `methods`，dense 余弦 | 一致 |
 | Hybrid = dense + sparse，Qdrant 原生 RRF（k=60） | 一致，`Prefetch` + `Fusion.RRF` |
 | `hybrid_find_feature`：FTS + 向量，按类去重 | 已实现（Tool 14）；FTS 分归一到 0-1，向量用 cosine × 0.8 |
-| Cross-Encoder 精排 | 新增：`BAAI/bge-reranker-v2-m3-int8` 对规则召回的候选重排 top-K |
-| 索引文本 `search_document: 类:{class} 方法:{method}\n{body[:2000]}` | Qwen profile 改为裸文本 `类:{class} 方法:{method}\n{body}`；BGE profile 保留原前缀 |
+| Cross-Encoder 精排 | 新增：`BAAI/bge-reranker-v2-m3-int8` 方法级精排（FTS 方法 top-15 + 向量 top-15，同类取最高分） |
+| 索引文本 `search_document: 类:{class} 方法:{method}\n{body[:2000]}` | 追加**文档注释**与**同义词标签**：`类:{class} 方法:{method}\n业务标签:{tags}\n{comment}\n{body}`；BGE profile 保留 `search_document:` 前缀 |
 | 查询文本 `search_query: {query}`；片段 `search_document: {code}` | Qwen profile 用 `Instruct: {task}\nQuery: {query}`，片段裸代码；BGE profile 保留原前缀 |
 | `point_id = MD5(file_path:method_name)[:16]` | 一致，upsert 天然幂等 |
 | payload：class/method/module/language/file/line/body_preview | 一致 |
 | 跳过 <3 行或 <80 字符的方法 | 一致 |
-| `embedding_cache.db`：key=`MD5("{model}:{text}")`，float32 BLOB | 一致，稠密 `cache` + 稀疏 `sparse_cache` |
+| `embedding_cache.db`：key=`MD5("{model}:{text}")`，float32 BLOB | 一致，稠密 `cache` + 稀疏 `sparse_cache`；另加 `rerank_cache` 缓存精排分 |
 | `build_meta.json` / `file_hashes.json` 增量 | 一致 |
 | `vector_search` / `find_similar_code` / `search_similar_snippet` / `scan_duplicates` | 前三个已实现；`scan_duplicates` 的能力由 P3-a `find_duplicates` 覆盖（词法指纹，可复现） |
 | Qdrant server | 用 `QdrantClient(path=...)` 本地持久化，API 语义一致；换 server 只改构造参数 |
+
+索引文本比参考方案多两块，都是为了「问题里没有代码字面量」的场景：
+
+- **文档注释**：声明前紧邻的注释（去掉 `MARK:` 这类分隔符，最多 300 字符）。
+  中文业务说明常写在这里，例如「当前城市数据加载失败时给出可见反馈与重试提示」。
+- **同义词标签**：读 `.ios_qa/synonyms.json`，当类名/方法名/模块/注释命中某组
+  （如 `TBCrashReporter` 命中 `crash`）时，把组里尚未出现的词写进
+  `业务标签:` 行（`崩溃 crash`）。这样「崩溃日志怎么上报」能命中英文命名的类；
+  每方法最多 3 组、12 个词，避免标签压过方法体。
+
+精排是**方法级**的：`hybrid_find_feature` 用 FTS 方法命中 top-15 + 向量 top-15
+组成候选，对 `(问题, 类名 + 方法名 + 注释 + 方法体)` 逐对打分。只按类精排会
+被「向量最相近但无关的方法」带偏（实测行情页曾选中 `tb_updateMonitorScreen`），
+方法级候选 + 同类取最高分解决了这个问题，`rerank_method` 返回真正被选中的方法。
+
+CPU 上每对约 0.7s，所以分数写入 `embedding_cache.db.rerank_cache`
+（key = `MD5("{reranker}:{query}␟{document}")`）：同一问题重复问、eval 重跑
+直接命中缓存，实测暖查询 0.02s；方法体/注释变了 key 自动失效。
 
 文档内部有一处冲突：总览写 `jina-embeddings-v2-base-code`（768 维），
 MCP 技术分析写 BGE-512。我们没有在这两个里二选一，而是把模型/维度/文本模板
@@ -563,6 +581,15 @@ MCP 技术分析写 BGE-512。我们没有在这两个里二选一，而是把�
 
 维度记录在 `build_meta.json` 里：换 profile 后 `_vector_status` 会发现
 model/dim 不一致并提示重新运行 `vectors`，不会拿旧维度的索引硬查。
+
+精排模型默认 `BAAI/bge-reranker-v2-m3-int8`（多语言，中文问题 ↔ 代码有效），
+可用 `IOS_QA_RERANK_MODEL` 覆盖。实测过的替代项都不如它：
+
+| 模型 | 每对耗时 | 结论 |
+|---|---|---|
+| `bge-reranker-v2-m3-int8` | ≈0.75s | 默认；7 条真实问题 top-3 全部命中 |
+| `BAAI/bge-reranker-base` | ≈0.36s | 快一倍但分数过平（演示页 `dumpMonitorState` 0.88、`setupChildControllers` 0.89），天气/日志掉出 top-3，弃用 |
+| `jinaai/jina-reranker-v2-base-multilingual` | ≈0.41s | 分数区分度不足，弃用 |
 
 安装依赖（首次运行会下载约 1.1 GB 的 INT8 embedding 模型；精排另需
 约 0.6 GB 的 reranker）：
@@ -624,11 +651,13 @@ python3 -m ios_qa hybrid "网络请求失败怎么重试" --no-rerank   # 只看
 - Qdrant 本地模式有目录锁：同一个 `qdrant_storage` 不能并发开两个 client，
   `QueryService.close()` 会按顺序关闭 store / 缓存 / SQLite。
 
-实测本工程：1946 个有方法体的方法 → 1522 个可向量化。Qwen3-INT8 全量
-`vectors` 约 78 分钟（CPU，`EMBED_BATCH=32`，模型已缓存；这是首次建库的
-一次性成本），之后增量索引只重算变更文件，2~4 秒；同一进程内 embedding /
-reranker 只加载一次，命中缓存的语义查询 <1 秒。只想快速重建时用
-`IOS_QA_EMBED_PROFILE=bge-small-zh`，全量约 3 秒。
+实测本工程：1946 个有方法体的方法 → 1522 个可向量化。Qwen3-INT8 冷启动全量
+`vectors` 约 78 分钟（CPU，`EMBED_BATCH=32`，模型已缓存；一次性成本）。之后
+增量索引只重算变更文件，2~4 秒；但改了注释或 `.ios_qa/synonyms.json` 会让
+对应方法的索引文本变化，需要重新嵌入（本次加注释/标签时全量重建约 33 分钟）。
+同一进程内 embedding / reranker 只加载一次；命中 `embedding_cache` 与
+`rerank_cache` 的查询 0.02s，未命中时首次精排约 20s。只想快速重建时用
+`IOS_QA_EMBED_PROFILE=bge-small-zh`，冷启动全量约 3 秒。
 
 已知限制：Qwen3-0.6B 是通用多语言模型，不是代码专用模型；中文 query →
 ObjC/Swift 方法体的排序靠「FTS 召回 + Cross-Encoder」兜底，类名/方法名
@@ -890,10 +919,11 @@ python3 -m ios_qa notifications --unbalanced
   `TBFinanceHTTP`）；候选召回仍依赖问题里的字面量，完全同义改写会漏。
   命中的类/方法名明确时优先用 `find_feature` / `search_methods` / `trace_class`；
 - **同义词覆盖不足**：代码里没有“离屏渲染”“失败重试”这类字面量时，
-  纯关键词会命中相近词的类（相机 Metal 渲染）。需要往 `.ios_qa/synonyms.json`
-  补业务组；P1 计划把同义词写进索引文本，而不是只做查询侧扩展；
-- Cross-Encoder 首次使用要下载约 0.6 GB 模型，候选 20~45 个时单次精排约数秒；
-  不需要时传 `rerank=False` 只走规则排序；
+  纯关键词会命中相近词的类（相机 Metal 渲染）。已把 `.ios_qa/synonyms.json`
+  写进索引文本（`业务标签:` 行）；剩下的是同词多义和长句改写，需要查询侧继续
+  补同义词组；
+- Cross-Encoder 首次使用要下载约 0.6 GB 模型；约 30 个候选冷启动单次约 20s，
+  命中 `rerank_cache` 后 0.02s；不需要时传 `rerank=False` 只走规则排序；
 - 不解析 Objective-C++ 模板细节与宏展开。
 
 ## 后续
