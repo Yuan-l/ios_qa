@@ -84,6 +84,16 @@ class VectorTopMarginTest(unittest.TestCase):
         )
         self.assertFalse(ok, detail)
 
+    def test_max_results_asserts_precision(self) -> None:
+        """精度：默认阈值下伪代码不应命中任何真实实现。"""
+        empty = {"available": True, "results": []}
+        ok, detail = _check(empty, {"kind": "max_results", "value": 0})
+        self.assertTrue(ok, detail)
+
+        ok, detail = _check(self.data, {"kind": "max_results", "value": 1})
+        self.assertFalse(ok, detail)
+        self.assertIn("count=2 <= 1", detail)
+
 
 class _FakeService:
     def __init__(self, *args, **kwargs) -> None:

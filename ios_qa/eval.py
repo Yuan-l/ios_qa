@@ -214,7 +214,7 @@ def _check(data: dict, spec: dict) -> tuple[bool, str]:
         ]
         return False, f"{sorted(wanted)} not in top {max_rank}: {seen}"
 
-    if kind == "min_results":
+    if kind in {"min_results", "max_results"}:
         rows = (
             data.get("results")
             or data.get("pages")
@@ -222,8 +222,11 @@ def _check(data: dict, spec: dict) -> tuple[bool, str]:
             or data.get("methods")
             or []
         )
-        ok = len(rows) >= int(spec["value"])
-        return ok, f"count={len(rows)} >= {spec['value']}"
+        count = len(rows)
+        if kind == "min_results":
+            return count >= int(spec["value"]), f"count={count} >= {spec['value']}"
+        # 精度断言：默认阈值下不该有任何命中（例如伪代码不应匹配到真实实现）
+        return count <= int(spec["value"]), f"count={count} <= {spec['value']}"
 
     if kind == "superclass_equals":
         rows = data.get("results") or []

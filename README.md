@@ -657,15 +657,15 @@ python3 -m ios_qa similar-snippet SomeSnippet.m --min-similarity 0.75
 ```text
 $ python3 -m ios_qa semantic "相机拍照后怎么保存图片"
 语义检索「相机拍照后怎么保存图片」  rrf  索引 1563 个方法
-1. 0.833  TBSuperResolutionViewController.saveTapped  [TBImageEditorKit]
-   components/TBImageEditorKit/TBImageEditorKit/Classes/UI/TBSuperResolutionViewController.swift:289-310
-   guard let image = resultImage else { return } let loading = TBEditorHUD.show(in: view, text: "正在写入相册…")
-2. 0.667  MainCameraEditViewController.saveImageToTempDirectory  [MyCameraModule]
-   components/MyCameraModule/Classes/EditModule/MainCameraEditViewController.swift:77-92
-   guard let data = image.jpegData(compressionQuality: 0.8) else { return nil } ...
-3. 0.533  ImageEditorViewController.image  [MyCameraModule]
+1. 0.667  ImageEditorViewController.image  [MyCameraModule]
    components/MyCameraModule/ViewController/ImageEditorViewController.swift:259-265
    if let error = error { print("保存失败: ...") } else { print("图片保存成功") }
+2. 0.625  MainCameraEditViewController.init  [MyCameraModule]
+   components/MyCameraModule/Classes/EditModule/MainCameraEditViewController.swift:33-38
+   self.image = image super.init(nibName: nil, bundle: nil) // 保存图片到临时目录 self.imagePath = ...
+3. 0.500  ImageEditorViewController.saveImage  [MyCameraModule]
+   components/MyCameraModule/ViewController/ImageEditorViewController.swift:253-257
+   guard let image = resultImageView.image ?? originalImage else { return } UIImageWriteToSavedPhotosAlbum(...)
 ```
 
 真实问答建议直接用混合检索：规则负责召回，Cross-Encoder 决定顺序。
@@ -820,7 +820,7 @@ python3 -m ios_qa build --check
 
 | kind | 断言内容 |
 |---|---|
-| `class_in_results` / `min_results` | 结果类名包含 / 至少 N 条（results/pages/callers） |
+| `class_in_results` / `min_results` / `max_results` | 结果类名包含 / 至少 N 条 / 至多 N 条（results/pages/callers）；`max_results: 0` 用于精度断言 |
 | `superclass_equals` | 首条结果的父类 |
 | `method_at_line` | 方法名 + 文件后缀 + 行号（`method_name` / `file_suffix` / `line`） |
 | `trace_found` | `trace` 找到目标 |
@@ -935,10 +935,10 @@ python3 -m ios_qa calibrate --samples 60
 | 分类归属 | `search_symbol("BreadCrumb")` 命中 `UIViewController` 等 5 个宿主类 |
 | 同名类消歧 | `trace TBTabbarViewController` 返回 2 个声明点，`--module` 切换后方法不串模块 |
 | 向量索引 | 1563 个方法（≥3 行且 ≥80 字符，含同名重载）；`dense` + `dense_body` 两条通道，Qwen3 冷启动全量约 2.3 小时（一次性），增量约 2~4s；本次补重载 + 布局重建命中缓存约 160s |
-| `eval` golden 用例 | **38/38 通过**（含 2 条语义 + 7 条真实问答；无向量时 29 通过 + 9 跳过） |
+| `eval` golden 用例 | **40/40 通过**（含 2 条语义 + 3 条片段 + 7 条真实问答；无向量时 29 通过 + 11 跳过） |
 | MCP 双客户端验收 | `raw-jsonrpc` 与 `python-sdk` 各 19 个工具；18 个只读工具与查询层逐字段一致 |
 | UI 文案检索 | `find_feature("行情")` 命中 `TBFinanceHomeViewController`；注释里的中文不进类级检索 |
-| 测试 | 99 个 unittest 全部通过（真模型不参与单测，用假 embedder 验链路） |
+| 测试 | 134 个 unittest 全部通过（13 跳过；真模型不参与单测，用假 embedder 验链路） |
 
 ### 真实 MCP 会话回放
 
@@ -952,7 +952,7 @@ MCP SDK 真实拉起 `python3 -m ios_qa mcp` 子进程，按开发者口吻连�
 | 启动后怎么进入行情详情页？ | ✅ `AppDelegate --tab--> TBFinanceHomeViewController`(AppDelegate.swift:59) `--push--> TBFinanceDetailViewController`(.m:838) |
 | 有哪些重复代码？ | ✅ 21 组（精确 13 / 近似 8），能列出 `ImageEditorViewController` 的近似方法簇 |
 | 行情页数据从哪来？ | ⚠️ 结构化链路通，但 `trace_class` 的 `callers` 里混入 `NSCalendar` 等系统类，需要在结果里筛 `own_class` |
-| 相机拍照后怎么保存图片？ | ✅ `hybrid_find_feature` #1 `MainCameraEditViewController.saveImageToTempDirectory` |
+| 相机拍照后怎么保存图片？ | ✅ `hybrid_find_feature` #1 `MainCameraEditViewController`（精排命中该类的 `init`，方法体注释含「保存图片到临时目录」；片段检索可精确命中 `saveImageToTempDirectory`） |
 | 行情页面怎么加载数据？ | ✅ #1 `TBFinanceHomeViewController.loadQuotesForCategory:` |
 | 网络请求失败怎么重试？ | ✅ `TBFinanceHTTP.attemptGETAtIndex:...` 进 top-3；#1 是 `TBNetworkFacadeSmokeViewController.requestFailure`（演示页） |
 | 怎么监控主线程卡顿？ | ✅ #1 `TDHangWatchdog.loop` |
@@ -1034,10 +1034,15 @@ python3 -m ios_qa notifications --unbalanced
 - **P3-b（已完成）**：向量语义检索 —— Qdrant `methods` collection（Qwen3-1024 +
   BM42，RRF k=60）、`embedding_cache.db`、`file_hashes.json` 增量；
   `vectors` / `semantic` / `similar-snippet`、`vector_search` /
-  `search_similar_snippet`、`find_similar_code(mode=semantic)`（片段通道
-  `dense_body` 与文档通道 `dense` 分开）；
+  `search_similar_snippet`、`find_similar_code(mode=semantic)`；
+- **P3-c（已完成）**：片段检索通道 —— `dense_body` 命名向量（索引/查询同构）、
+  `point_id` 带行号（修复同文件重载互相覆盖，补回 41 个方法）、布局与
+  `point_scheme` 指纹强制重建；片段自查 1.0，伪代码 0.555 被默认阈值挡掉；
+  golden 扩到 40 条（含重载自查与精度断言）；
 - **P0（检索质量，已完成）**：模型 profile（默认 Qwen3-INT8，BGE/jina 可切）；
   `hybrid_find_feature`（FTS + cosine×0.8，按类合并）；Cross-Encoder
-  `bge-reranker-v2-m3-int8` 精排；7 条真实问答 golden（top-3 断言）；golden 扩到 38 条；
-- **下一步**：索引期同义词标签、注释入 embedding、Agent Loom 接入（MCP 已是
-  稳定协议层，不绑定模型）。
+  `bge-reranker-v2-m3-int8` 精排；索引期同义词标签与文档注释已并入 embedding；
+  `min_margin` 断言 + `template_id` 契约 + `calibrate` 标定；7 条真实问答 golden
+  （top-3 断言）；
+- **下一步**：Agent Loom / 其他 MCP 客户端接入（协议层已稳定，不绑定模型）；
+  多工程巡检与索引新鲜度自动提醒。
