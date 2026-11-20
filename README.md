@@ -687,7 +687,7 @@ python3 -m ios_qa hybrid "网络请求失败怎么重试" --no-rerank   # 只看
 - Qdrant 本地模式有目录锁：同一个 `qdrant_storage` 不能并发开两个 client，
   `QueryService.close()` 会按顺序关闭 store / 缓存 / SQLite。
 
-实测本工程：1960 个有方法体的方法 → 1569 个可向量化（`point_id` 带上行号后，
+实测本工程：1967 个有方法体的方法 → 1569 个可向量化（随源码增长；`point_id` 带上行号后，
 先前被同名重载覆盖的 41 个方法也进了索引）。Qwen3-INT8 冷启动全量 `vectors`
 约 78 分钟（文档通道）+ 57 分钟（片段通道），CPU、`EMBED_BATCH=32`、模型已
 缓存；一次性成本。之后增量索引只重算变更文件，2~4 秒。**改注释或
