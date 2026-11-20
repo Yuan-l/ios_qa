@@ -656,7 +656,7 @@ python3 -m ios_qa similar-snippet SomeSnippet.m --min-similarity 0.75
 
 ```text
 $ python3 -m ios_qa semantic "相机拍照后怎么保存图片"
-语义检索「相机拍照后怎么保存图片」  rrf  索引 1563 个方法
+语义检索「相机拍照后怎么保存图片」  rrf  索引 1569 个方法
 1. 0.667  ImageEditorViewController.image  [MyCameraModule]
    components/MyCameraModule/ViewController/ImageEditorViewController.swift:259-265
    if let error = error { print("保存失败: ...") } else { print("图片保存成功") }
@@ -687,7 +687,7 @@ python3 -m ios_qa hybrid "网络请求失败怎么重试" --no-rerank   # 只看
 - Qdrant 本地模式有目录锁：同一个 `qdrant_storage` 不能并发开两个 client，
   `QueryService.close()` 会按顺序关闭 store / 缓存 / SQLite。
 
-实测本工程：1960 个有方法体的方法 → 1563 个可向量化（`point_id` 带上行号后，
+实测本工程：1960 个有方法体的方法 → 1569 个可向量化（`point_id` 带上行号后，
 先前被同名重载覆盖的 41 个方法也进了索引）。Qwen3-INT8 冷启动全量 `vectors`
 约 78 分钟（文档通道）+ 57 分钟（片段通道），CPU、`EMBED_BATCH=32`、模型已
 缓存；一次性成本。之后增量索引只重算变更文件，2~4 秒。**改注释或
@@ -934,7 +934,7 @@ python3 -m ios_qa calibrate --samples 60
 | 协议/block 调用 | `delegate?.captureOutput` → `CameraCaptureViewModelDelegate`；`onSelect` 4 处 block 调用 |
 | 分类归属 | `search_symbol("BreadCrumb")` 命中 `UIViewController` 等 5 个宿主类 |
 | 同名类消歧 | `trace TBTabbarViewController` 返回 2 个声明点，`--module` 切换后方法不串模块 |
-| 向量索引 | 1563 个方法（≥3 行且 ≥80 字符，含同名重载）；`dense` + `dense_body` 两条通道，Qwen3 冷启动全量约 2.3 小时（一次性），增量约 2~4s；本次补重载 + 布局重建命中缓存约 160s |
+| 向量索引 | 1569 个方法（≥3 行且 ≥80 字符，含同名重载）；`dense` + `dense_body` 两条通道，Qwen3 冷启动全量约 2.3 小时（一次性），增量约 2~4s；本次补重载 + 布局重建命中缓存约 160s |
 | `eval` golden 用例 | **40/40 通过**（含 2 条语义 + 3 条片段 + 7 条真实问答；无向量时 29 通过 + 11 跳过） |
 | MCP 双客户端验收 | `raw-jsonrpc` 与 `python-sdk` 各 19 个工具；18 个只读工具与查询层逐字段一致 |
 | UI 文案检索 | `find_feature("行情")` 命中 `TBFinanceHomeViewController`；注释里的中文不进类级检索 |
